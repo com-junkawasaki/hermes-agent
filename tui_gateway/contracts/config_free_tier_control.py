@@ -242,6 +242,10 @@ class ModelCapabilities(Result):
     fast: bool
     reasoning: bool
     can_disable_reasoning: bool | None = None
+    # The ladder a custom route declared for this model on its own ``/v1/models``
+    # (``reasoningEfforts`` — the levels it admits; anything else is a 400 there).
+    # None when the route declares nothing: the picker offers its full vocabulary.
+    efforts: list[str] | None = None
 
 
 class ModelOptionProvider(OpenModel):

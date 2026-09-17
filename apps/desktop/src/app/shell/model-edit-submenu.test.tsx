@@ -31,6 +31,7 @@ function renderSubmenu(opts: {
   onSelectModel?: (model: string) => void
   onSetOptions: (patch: { effort?: string; fast?: boolean }) => void
   reasoning: boolean
+  efforts?: string[] | null
 }) {
   return render(
     <DropdownMenu open>
@@ -40,6 +41,7 @@ function renderSubmenu(opts: {
           <ModelEditSubmenu
             defaultEffort={opts.defaultEffort ?? 'medium'}
             effort={opts.effort ?? 'medium'}
+            efforts={opts.efforts}
             fastControl={opts.fastControl}
             isActive={opts.isActive ?? true}
             model="m1"
@@ -127,5 +129,46 @@ describe('ModelEditSubmenu reports edits without performing them', () => {
     fireEvent.click(screen.getByRole('switch'))
 
     expect(onSelectModel).toHaveBeenCalledWith('m1-fast')
+  })
+})
+
+// A route that declares its ladder on /v1/models (reasoningEfforts —
+// api.kotoba.cloud, ADR 2609160940) REJECTS levels outside it, so the submenu
+// must not offer them. `none` lives in the Thinking toggle, not the radio.
+describe('ModelEditSubmenu honors a declared effort ladder', () => {
+  it('offers only the declared levels (none folds into the toggle)', () => {
+    renderSubmenu({
+      efforts: ['none', 'low', 'medium', 'high'],
+      fastControl: { kind: 'none' },
+      onSetOptions: vi.fn(),
+      reasoning: true
+    })
+
+    expect(screen.getAllByRole('menuitemradio')).toHaveLength(3)
+    expect(screen.getByRole('switch')).toBeTruthy()
+  })
+
+  it('offers the full vocabulary when the route declares nothing', () => {
+    renderSubmenu({
+      fastControl: { kind: 'none' },
+      onSetOptions: vi.fn(),
+      reasoning: true
+    })
+
+    expect(screen.getAllByRole('menuitemradio')).toHaveLength(7)
+  })
+
+  it('a stale configured level is no longer offered once the route rejects it', () => {
+    const onSetOptions = vi.fn()
+    renderSubmenu({
+      effort: 'xhigh',
+      efforts: ['none', 'low', 'medium', 'high'],
+      fastControl: { kind: 'none' },
+      onSetOptions,
+      reasoning: true
+    })
+
+    // xhigh is gone from the menu (the route 400s it) — the offered ceiling stops at high.
+    expect(screen.getAllByRole('menuitemradio')).toHaveLength(3)
   })
 })

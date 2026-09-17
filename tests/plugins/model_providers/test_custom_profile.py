@@ -180,3 +180,71 @@ class TestCustomReasoningWithNumCtx:
         assert eb == {"options": {"num_ctx": 8192}}
         assert tl == {}
 
+
+
+class TestDeclaredLadderClamp:
+    """A custom route that publishes its own ``reasoningEfforts`` ladder
+    (api.kotoba.cloud, ADR 2609160940) admits nothing deeper — the wire
+    clamps to the declaration, nearest weaker, so a stale configured
+    xhigh degrades honestly instead of breaking the session on a 400."""
+
+    LADDER = ["none", "minimal", "low", "medium", "high"]
+
+    def _patch_declared(self, monkeypatch, efforts):
+        import hermes_cli.models_reasoning_caps as caps_mod
+
+        def _caps(base_url, model_id, **kw):
+            if not base_url or not model_id or efforts is None:
+                return None
+            return {"supports_reasoning": True, "supported_efforts": list(efforts),
+                    "mandatory": "none" not in efforts, "authoritative": True}
+
+        monkeypatch.setattr(caps_mod, "custom_route_model_reasoning_capabilities", _caps)
+
+    def test_deeper_level_clamps_to_offered_ceiling(self, custom_profile, monkeypatch):
+        self._patch_declared(monkeypatch, self.LADDER)
+        _eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "xhigh"},
+            model="qwen3.8-flash-next-whitehacker",
+            base_url="https://api.kotoba.cloud/v1")
+        assert tl == {"reasoning_effort": "high"}
+
+    def test_ultra_clamps_to_offered_ceiling(self, custom_profile, monkeypatch):
+        self._patch_declared(monkeypatch, self.LADDER)
+        _eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "ultra"},
+            model="qwen3.8-flash-next-whitehacker",
+            base_url="https://api.kotoba.cloud/v1")
+        assert tl == {"reasoning_effort": "high"}
+
+    def test_offered_levels_pass_through(self, custom_profile, monkeypatch):
+        self._patch_declared(monkeypatch, self.LADDER)
+        _eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "medium"},
+            model="qwen3.8-flash-next-whitehacker",
+            base_url="https://api.kotoba.cloud/v1")
+        assert tl == {"reasoning_effort": "medium"}
+
+    def test_none_survives_when_offered(self, custom_profile, monkeypatch):
+        self._patch_declared(monkeypatch, self.LADDER)
+        _eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "none"},
+            model="qwen3.8-flash-next-whitehacker",
+            base_url="https://api.kotoba.cloud/v1")
+        assert tl == {"reasoning_effort": "none"}
+
+    def test_off_omitted_when_ladder_has_no_none(self, custom_profile, monkeypatch):
+        """A thinking-off ask to a route that can't switch thinking off sends
+        neither value — the route's default (which cannot be turned off) applies."""
+        self._patch_declared(monkeypatch, ["minimal", "low", "high"])
+        _eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": False}, model="locked", base_url="https://locked.example/v1")
+        assert "reasoning_effort" not in tl
+
+    def test_unknown_route_keeps_wire_vocabulary(self, custom_profile, monkeypatch):
+        """No declaration → today's behavior: clamp only the ultra extension."""
+        self._patch_declared(monkeypatch, None)
+        _eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "ultra"},
+            model="anything", base_url="https://undeclared.example/v1")
+        assert tl == {"reasoning_effort": "max"}

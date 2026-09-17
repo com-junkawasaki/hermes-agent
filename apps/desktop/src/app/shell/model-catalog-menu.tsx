@@ -576,6 +576,7 @@ export function ModelCatalogMenu({
                           canDisableReasoning={caps?.can_disable_reasoning ?? undefined}
                           defaultEffort={defaultEffort}
                           effort={effEffort}
+                          efforts={caps?.efforts ?? undefined}
                           fastControl={fastControl}
                           isActive={isCurrent}
                           model={family.id}

@@ -2430,6 +2430,15 @@ def probe_api_models(
             continue
         if _neg_key is not None:
             _probe_neg_cache.pop(_neg_key, None)
+        # Same document, zero extra network: a custom route's own reasoning-effort
+        # ladder (``reasoningEfforts``) travels on these items — mirror it so the
+        # picker constrains the effort menu and the wire clamps to what is offered
+        # (owner direction 2026-09-16: admit only what the deployment can deliver).
+        try:
+            from hermes_cli.models_reasoning_caps import seed_custom_route_reasoning_caps
+            seed_custom_route_reasoning_caps(candidate_base.rstrip("/"), data.get("data"))
+        except Exception:
+            pass
         return _probe_result(
             [m.get("id", "") for m in data.get("data", [])], url, candidate_base.rstrip("/"),
             alternate_base if alternate_base != candidate_base else normalized, is_fallback)
