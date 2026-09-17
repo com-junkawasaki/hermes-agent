@@ -660,6 +660,26 @@ def _main_model_reasoning_efforts(model: str, provider: str) -> Optional[list[st
     if slug == "copilot":
         from hermes_cli.models import github_model_reasoning_efforts
         return github_model_reasoning_efforts(model) or None
+    # A user-defined route that declares its ladder (reasoningEfforts on its own
+    # /v1/models) admits nothing else — offer only what it admits (levels outside
+    # the ladder are a 400 at admission; api.kotoba.cloud, ADR 2609160940).
+    try:
+        from hermes_cli.models_reasoning_caps import (
+            custom_route_base_url_for_provider,
+            custom_route_model_reasoning_capabilities,
+        )
+        route_base = custom_route_base_url_for_provider(slug)
+    except Exception:
+        route_base = None
+    if route_base:
+        try:
+            caps = custom_route_model_reasoning_capabilities(route_base, model)
+        except Exception:
+            caps = None
+        if caps and caps.get("authoritative"):
+            declared = [e for e in (caps.get("supported_efforts") or []) if e and e != "none"]
+            if declared:
+                return declared
     try:
         from agent.models_dev import get_model_capabilities
         meta = get_model_capabilities(slug, model)

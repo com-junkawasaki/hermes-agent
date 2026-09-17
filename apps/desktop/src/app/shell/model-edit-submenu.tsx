@@ -88,6 +88,13 @@ interface ModelEditSubmenuProps {
   provider: string
   /** Whether this model supports reasoning effort. */
   reasoning: boolean
+  /** Levels the ACTIVE ROUTE declares on its own /v1/models (`reasoningEfforts`)
+   *  — the ladder it admits; anything deeper is a 400 at admission. When present
+   *  the effort radio offers only these (plus the Thinking toggle for `none`),
+   *  so a stale configured level stays visible as the pill shows it but is no
+   *  longer re-offerable. Null/undefined = the route declares nothing: full
+   *  vocabulary. */
+  efforts?: string[] | null
 }
 
 export function ModelEditSubmenu(props: ModelEditSubmenuProps) {
@@ -109,6 +116,7 @@ export function ModelOptionsContent({
   canDisableReasoning,
   defaultEffort,
   effort,
+  efforts,
   fastControl,
   isActive,
   onSelectModel,
@@ -121,6 +129,10 @@ export function ModelOptionsContent({
   const effortValue = resolveReasoningEffort(effort, defaultEffort)
   const thinkingOn = isThinkingEnabled(effort, defaultEffort)
   const showThinkingToggle = reasoning && canDisableReasoning !== false
+  // A route that declares its ladder (reasoningEfforts on /v1/models) REJECTS
+  // levels outside it — offer only what it admits. `none` lives in the Thinking
+  // toggle, so it drops out of the radio list with the off-state it never had.
+  const ladder = efforts?.length ? REASONING_EFFORTS.filter(value => efforts.includes(value)) : [...REASONING_EFFORTS]
 
   const setFast = (enabled: boolean) => {
     if (fastControl.kind === 'variant') {
@@ -166,12 +178,12 @@ export function ModelOptionsContent({
           <Switch checked={fastOn} className="ml-auto" onCheckedChange={setFast} size="xs" />
         </DropdownMenuItem>
       ) : null}
-      {reasoning ? (
+      {reasoning && ladder.length > 0 ? (
         <>
           <DropdownMenuSeparator className="mx-0" />
           <DropdownMenuLabel className={dropdownMenuSectionLabel}>{copy.effort}</DropdownMenuLabel>
           <DropdownMenuRadioGroup onValueChange={value => onSetOptions({ effort: value })} value={effortValue}>
-            {REASONING_EFFORTS.map(value => (
+            {ladder.map(value => (
               <DropdownMenuRadioItem
                 className={dropdownMenuRow}
                 key={value}

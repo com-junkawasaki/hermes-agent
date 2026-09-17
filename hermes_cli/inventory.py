@@ -273,7 +273,11 @@ def _apply_capabilities(rows: list[dict]) -> None:
     """Attach ``{model: {fast, reasoning, ...}}`` per row. ``reasoning`` defaults True when the catalog is
     silent (the dial is a no-op on models that ignore it; hiding it from a capable model is worse). A
     serving aggregator's detail overrides models.dev (adds ``can_disable_reasoning``). ``supported_efforts``
-    is deliberately NOT forwarded — it under-reports levels that work."""
+    is deliberately NOT forwarded from AGGREGATORS — it under-reports levels that work. A custom route's
+    OWN ``reasoningEfforts`` declaration is different: it is the ladder that route enforces at admission
+    (levels outside it answer 400 — api.kotoba.cloud, ADR 2609160940), so it IS forwarded as ``efforts``
+    and the picker constrains itself to it.
+    """
     from hermes_cli.models import model_supports_fast_mode
 
     try:
@@ -281,10 +285,31 @@ def _apply_capabilities(rows: list[dict]) -> None:
     except Exception:
         get_model_capabilities = None  # type: ignore[assignment]
 
+    try:
+        from hermes_cli.models_reasoning_caps import (
+            custom_route_model_reasoning_capabilities,
+            warm_custom_route_reasoning_caps_async,
+        )
+    except Exception:
+        custom_route_model_reasoning_capabilities = None  # type: ignore[assignment]
+        warm_custom_route_reasoning_caps_async = None  # type: ignore[assignment]
+
     for row in rows:
         slug = row.get("slug") or ""
         caps: dict[str, dict[str, Any]] = {}
         read_reasoning_catalog = _reasoning_catalog_reader(slug.lower())
+        # User-defined rows carry their endpoint: consult that route's own declaration.
+        # The picker must never block on HTTP — cache-only read, background warm.
+        api_url = str(row.get("api_url") or "") if row.get("is_user_defined") else ""
+        read_custom_route = None
+        if api_url and custom_route_model_reasoning_capabilities is not None:
+            if warm_custom_route_reasoning_caps_async is not None:
+                try:
+                    warm_custom_route_reasoning_caps_async(api_url)
+                except Exception:
+                    pass
+            read_custom_route = lambda model, _u=api_url: custom_route_model_reasoning_capabilities(  # noqa: E731
+                _u, model, allow_fetch=False)
 
         for model in row.get("models") or []:
             reasoning = True
@@ -309,6 +334,19 @@ def _apply_capabilities(rows: list[dict]) -> None:
                     entry["reasoning"] = False
                 elif detail:
                     entry["can_disable_reasoning"] = not detail.get("mandatory")
+
+            if read_custom_route is not None:
+                try:
+                    declared = read_custom_route(model)
+                except Exception:
+                    declared = None
+                if declared and declared.get("authoritative"):
+                    ladder = [str(e).strip().lower() for e in (declared.get("supported_efforts") or [])]
+                    ladder = [e for e in ladder if e]
+                    if ladder:
+                        entry["reasoning"] = True
+                        entry["efforts"] = ladder
+                        entry["can_disable_reasoning"] = "none" in ladder
 
             caps[model] = entry
 
