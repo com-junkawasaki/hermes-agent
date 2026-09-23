@@ -12,7 +12,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { Switch } from '@/components/ui/switch'
 import { useI18n } from '@/i18n'
-import { isThinkingEnabled, resolveReasoningEffort } from '@/lib/reasoning-effort'
+import { isThinkingEnabled, reasoningEffortClamp, resolveReasoningEffort } from '@/lib/reasoning-effort'
 
 // Hermes' real reasoning levels live in lib/reasoning-effort; `none` is owned
 // by the Thinking toggle, not the radio.
@@ -71,6 +71,9 @@ interface ModelEditSubmenuProps {
   /** This row's effective reasoning effort (live for the active model, else its
    *  preset) — the submenu shows and edits from this, never the raw session. */
   effort: string
+  /** Gateway-reported level the route actually sends for `effort` (active row
+   *  only; '' = unknown). A clamped pick is spelled out on its radio row. */
+  effortWire?: string
   /** How fast mode is offered for this model (param toggle vs. variant swap). */
   fastControl: FastControl
   /** Whether this row's model is the active one. */
@@ -117,6 +120,7 @@ export function ModelOptionsContent({
   defaultEffort,
   effort,
   efforts,
+  effortWire,
   fastControl,
   isActive,
   onSelectModel,
@@ -127,6 +131,7 @@ export function ModelOptionsContent({
   const copy = t.shell.modelOptions
 
   const effortValue = resolveReasoningEffort(effort, defaultEffort)
+  const clamp = reasoningEffortClamp(effortValue, effortWire)
   const thinkingOn = isThinkingEnabled(effort, defaultEffort)
   const showThinkingToggle = reasoning && canDisableReasoning !== false
   // A route that declares its ladder (reasoningEfforts on /v1/models) REJECTS
@@ -190,7 +195,7 @@ export function ModelOptionsContent({
                 onSelect={event => event.preventDefault()}
                 value={value}
               >
-                {copy[value]}
+                {clamp?.effort === value ? `${copy[value]} (${copy.sendsOnRoute(copy[clamp.wire])})` : copy[value]}
               </DropdownMenuRadioItem>
             ))}
           </DropdownMenuRadioGroup>

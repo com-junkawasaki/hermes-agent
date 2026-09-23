@@ -43,6 +43,7 @@ export function ReasoningMenuPanel(props: ModelMenuHostProps) {
       defaultEffort={defaultEffort}
       effort={controller.current.effort}
       efforts={caps?.efforts ?? undefined}
+      effortWire={controller.current.effortWire}
       fastControl={resolveFastControl(
         currentModel || model,
         providerModels,
