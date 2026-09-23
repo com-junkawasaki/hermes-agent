@@ -979,6 +979,12 @@ class GatewayAdapterLifecycleMixin:
         # serving: keep it on the loop, under the same scope. It reads only load_config(), so running
         # it after load_gateway_config() instead of before changes nothing it depends on.
         with _profile_runtime_scope(profile_home, hydrate_secrets=False):
+            # On the loop, not in the worker: it captures asyncio.get_running_loop() to hop late plugin
+            # loads back onto the gateway loop — from the worker thread that is a RuntimeError, the
+            # listener would get loop=None and late-loaded plugins would never re-wire (#87770).
+            # Same scope as discover_plugins() above, so get_plugin_manager() is the manager it filled.
+            from hermes_cli.plugins import get_plugin_manager
+            self._subscribe_plugin_rewire(get_plugin_manager(), profile_name, profile_home)
             # This profile's `hooks:` block: start() registered before any profile scope existed.
             self._register_config_hooks(
                 "shell-hook/webhook registration failed for profile '%s'", profile_name, level=logging.WARNING,

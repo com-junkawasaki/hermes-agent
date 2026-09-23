@@ -60,6 +60,37 @@ def parse_openrouter_reasoning_capabilities(item: Any) -> Optional[dict[str, Any
     return {"supports_reasoning": True, "supported_efforts": efforts, "mandatory": reasoning.get("mandatory") is True}
 
 
+def parse_declared_reasoning_efforts(item: Any) -> Optional[dict[str, Any]]:
+    """Parse an OpenAI-compat catalog's OWN depth ladder: a top-level
+    ``reasoningEfforts`` list on the ``/v1/models`` item.
+
+    Distinct from OpenRouter's inferred ``supported_efforts``: a route that
+    publishes this declares exactly the levels its served configuration can
+    deliver and rejects the rest at admission (api.kotoba.cloud, per the
+    ADR-2609160940 deployment — one llama.cpp instance with a fixed
+    thinking budget, so ``xhigh``/``max`` are answered 400, not clamped).
+    The declaration is therefore AUTHORITATIVE: callers clamp the wire to
+    it (a stale configured level must not break the session) and may
+    filter the picker by it. ``mandatory`` falls out of the ladder —
+    a route without a ``none`` level does not honor thinking-off.
+    None when the item declares nothing (unknown, not unrestricted).
+    """
+    if not isinstance(item, dict):
+        return None
+    raw = item.get("reasoningEfforts")
+    if not isinstance(raw, list):
+        return None
+    efforts = list(dict.fromkeys(str(e).strip().lower() for e in raw if str(e).strip()))
+    if not efforts:
+        return None
+    return {
+        "supports_reasoning": True,
+        "supported_efforts": efforts,
+        "mandatory": "none" not in efforts,
+        "authoritative": True,
+    }
+
+
 # ── Disk mirror ────────────────────────────────────────────────────────
 #
 # In-process caches are always cold in a short-lived process, and every consumer is on a hot path
@@ -135,20 +166,28 @@ def _seed_reasoning_caps(url: str, items: Any) -> Optional[Caps]:
     caps_by_id: Caps = {}
     for item in items:
         mid = str(item.get("id") or "").strip() if isinstance(item, dict) else ""
-        if mid:
-            caps_by_id[mid] = parse_openrouter_reasoning_capabilities(item)
+        if not mid:
+            continue
+        caps_by_id[mid] = (
+            parse_openrouter_reasoning_capabilities(item)
+            # Custom OpenAI-compat routes declare their ladder as a top-level
+            # ``reasoningEfforts`` instead of OpenRouter's supported_parameters
+            # shape; an item that answers neither stays unknown.
+            or parse_declared_reasoning_efforts(item)
+        )
     if not caps_by_id:
         return None
     _save_reasoning_caps_disk(url, caps_by_id)
     return caps_by_id
 
 
-def _fetch_reasoning_caps_catalog(url: str, timeout: float) -> Optional[Caps]:
+def _fetch_reasoning_caps_catalog(url: str, timeout: float, headers: Optional[dict[str, str]] = None) -> Optional[Caps]:
     """Fetch one OpenRouter-shaped ``/v1/models`` catalog → per-model caps; None when unreachable or
-    empty so callers remember the failure. Sends a User-Agent: the Portal 403s anonymous reads."""
+    empty so callers remember the failure. Sends a User-Agent: the Portal 403s anonymous reads;
+    custom routes pass whatever auth their config carries."""
     m = _origin()
     try:
-        req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": m._HERMES_USER_AGENT})
+        req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": m._HERMES_USER_AGENT, **(headers or {})})
         with m._urlopen_model_catalog_request(req, timeout=timeout) as resp:
             payload = json.loads(resp.read().decode())
     except Exception:
@@ -304,3 +343,146 @@ def warm_openrouter_reasoning_caps_async() -> None:
 def warm_nous_reasoning_caps_async() -> None:
     """Nous Portal counterpart of :func:`warm_openrouter_reasoning_caps_async`."""
     _warm_caps_async(_NOUS_CAPS)
+
+
+# ── Custom OpenAI-compat routes (per base_url) ─────────────────────────
+#
+# A user-defined provider (``providers:<name>`` / ``custom_providers:``) answers
+# /v1/models itself, so its declared ladder lives at ITS url — no fixed source to
+# parametrize like OpenRouter/Nous. The disk mirror is already keyed by catalog
+# URL, so one shared memory dict keyed the same way is enough; auth headers are
+# resolved per base_url from the custom-provider entry the route config declares.
+
+_CUSTOM_CAPS: dict[str, Caps] = {}
+_CUSTOM_FAILED_AT: dict[str, float] = {}
+_CUSTOM_LOCK = threading.Lock()
+
+
+def _custom_catalog_url(base_url: Optional[str]) -> Optional[str]:
+    """The ``/models`` catalog URL for a custom route's base_url, or None."""
+    raw = str(base_url or "").strip().rstrip("/")
+    if not raw or "://" not in raw:
+        return None
+    return f"{raw}/models"
+
+
+def _custom_headers_for(url: str) -> dict[str, str]:
+    """Auth/extra headers for the custom-provider entry owning *url*'s base (empty when none).
+
+    The picker seeds this cache from an authenticated discovery fetch, so headers
+    matter only for a background re-warm of a stale disk copy.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.config_providers import get_compatible_custom_providers
+        base = url[: -len("/models")]
+        for entry in get_compatible_custom_providers(load_config_readonly()):
+            entry_base = str((entry or {}).get("base_url") or "").strip().rstrip("/")
+            if entry_base.lower().removesuffix("/v1") == base.lower().removesuffix("/v1"):
+                headers = dict((entry or {}).get("extra_headers") or {})
+                key = str((entry or {}).get("api_key") or "")
+                if key:
+                    headers.setdefault("Authorization", f"Bearer {key}")
+                return headers
+    except Exception:
+        pass
+    return {}
+
+
+def custom_route_model_reasoning_capabilities(
+    base_url: Optional[str], model_id: Optional[str], *, timeout: float = 6.0,
+    allow_fetch: bool = True,
+) -> Optional[dict[str, Any]]:
+    """Declared reasoning capabilities for ``model_id`` on a custom OpenAI-compat route.
+
+    Tri-state like the aggregator readers: dict when the route's catalog declares it,
+    None when unknown (route unlisted, catalog not fetched yet, no declaration).
+    Reads the picker's in-memory seed, then the URL-keyed disk mirror; a stale disk
+    copy is served AND re-warmed off-thread — never blocks on HTTP.
+    """
+    model = str(model_id or "").strip()
+    url = _custom_catalog_url(base_url)
+    if not model or not url:
+        return None
+    with _CUSTOM_LOCK:
+        caps = _CUSTOM_CAPS.get(url)
+    if caps is None:
+        caps, age = _load_reasoning_caps_disk(url)
+        if caps is not None:
+            with _CUSTOM_LOCK:
+                _CUSTOM_CAPS[url] = caps
+            if age >= _REASONING_CAPS_DISK_TTL_SECONDS:
+                _refresh_custom_route_async(url)
+    if caps is None and allow_fetch:
+        failed_at = _CUSTOM_FAILED_AT.get(url)
+        if failed_at is not None and (time.monotonic() - failed_at) < 60:
+            return None
+        caps = _fetch_reasoning_caps_catalog(url, timeout, headers=_custom_headers_for(url))
+        if caps is None:
+            _CUSTOM_FAILED_AT[url] = time.monotonic()
+            return None
+        with _CUSTOM_LOCK:
+            _CUSTOM_CAPS[url] = caps
+    return caps.get(model) if caps is not None else None
+
+
+def warm_custom_route_reasoning_caps_async(base_url: Optional[str]) -> None:
+    """Background-refresh a custom route's declared ladders from its own catalog."""
+    url = _custom_catalog_url(base_url)
+    if not url:
+        return
+    with _CUSTOM_LOCK:
+        fresh = url in _CUSTOM_CAPS
+    if not fresh:
+        _refresh_custom_route_async(url)
+
+
+def seed_custom_route_reasoning_caps(base_url: Optional[str], items: Any) -> Optional[Caps]:
+    """Mirror a custom route's declared ladders from the ``/v1/models`` items the
+    picker already fetched — warm at zero network cost (same trick as the
+    OpenRouter/Nous seeding path)."""
+    url = _custom_catalog_url(base_url)
+    if not url:
+        return None
+    caps = _seed_reasoning_caps(url, items)
+    if caps is not None and any(caps.values()):
+        with _CUSTOM_LOCK:
+            _CUSTOM_CAPS[url] = caps
+        return caps
+    return None
+
+
+def custom_route_base_url_for_provider(provider: Optional[str]) -> Optional[str]:
+    """The configured ``base_url`` of the user-defined provider named *provider* (its
+    ``providers:<name>`` key / ``custom_providers`` entry name), or None when the slug
+    is not a user-defined route. Lets interactive flows resolve a route's declaration
+    from just the picker slug."""
+    slug = str(provider or "").strip().lower()
+    if not slug:
+        return None
+    try:
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.config_providers import get_compatible_custom_providers
+        for entry in get_compatible_custom_providers(load_config_readonly()):
+            keys = {
+                str((entry or {}).get("provider_key") or "").strip().lower(),
+                str((entry or {}).get("name") or "").strip().lower(),
+            }
+            if slug in keys - {""}:
+                base = str((entry or {}).get("base_url") or "").strip()
+                if base:
+                    return base
+    except Exception:
+        pass
+    return None
+
+
+def _refresh_custom_route_async(url: str) -> None:
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return
+    def _run() -> None:
+        caps = _fetch_reasoning_caps_catalog(url, 6.0, headers=_custom_headers_for(url))
+        if caps is not None:
+            with _CUSTOM_LOCK:
+                _CUSTOM_CAPS[url] = caps
+    threading.Thread(target=_run, name="reasoning-caps-custom-refresh", daemon=True).start()

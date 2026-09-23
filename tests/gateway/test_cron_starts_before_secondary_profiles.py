@@ -123,10 +123,12 @@ async def test_secondary_config_and_plugins_load_off_the_loop(monkeypatch, tmp_p
     monkeypatch.setattr(gw_run, "_own_policy_open_startup_violation", _record("violation", None))
     monkeypatch.setattr(gw_config, "load_gateway_config", _record("load_gateway_config", "PROFILE_CFG"))
     monkeypatch.setattr(plugins, "discover_plugins", _record("discover_plugins"))
+    monkeypatch.setattr(plugins, "get_plugin_manager", lambda: "MANAGER")
     monkeypatch.setattr(env_loader, "hydrate_profile_secret_sources", lambda home: None)
 
     runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / "sessions"))
     monkeypatch.setattr(runner, "_register_config_hooks", _record("register_hooks"))
+    monkeypatch.setattr(runner, "_subscribe_plugin_rewire", _record("subscribe_rewire"))
     monkeypatch.setattr(runner, "_snapshot_profile_busy_modes", lambda name, cfg: None)
 
     home = tmp_path / "profiles" / "p2"
@@ -146,7 +148,9 @@ async def test_secondary_config_and_plugins_load_off_the_loop(monkeypatch, tmp_p
         thread, scope = seen[name]
         assert thread != loop_thread, f"{name} ran on the event loop"
         assert scope == str(home), f"{name} did not see the profile scope"
-    thread, scope = seen["register_hooks"]
-    assert thread == loop_thread, "hook registration left the event loop"
-    assert scope == str(home)
+    for name in ("register_hooks", "subscribe_rewire"):
+        # subscribe_rewire captures asyncio.get_running_loop(): off the loop it would get None (#87770).
+        thread, scope = seen[name]
+        assert thread == loop_thread, f"{name} left the event loop"
+        assert scope == str(home), f"{name} did not see the profile scope"
     assert _SCOPE.get() is None, "profile scope leaked into the loop's context"
