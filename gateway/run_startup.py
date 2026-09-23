@@ -1513,6 +1513,14 @@ class GatewayStartupMixin:
         )
         if await self._abort_startup_if_shutdown_requested():
             return True
+        # The launch profile is connected: let cron start now rather than after every secondary
+        # profile (run.py installs the hook; absent in tests and embedders that start cron themselves).
+        _on_primary_ready = getattr(self, "_on_primary_adapters_ready", None)
+        if _on_primary_ready is not None:
+            try:
+                _on_primary_ready()
+            except Exception:
+                logger.warning("Early cron start failed; cron will start after all profiles", exc_info=True)
         _aborted, connected_count = await self._start_secondary_profiles(
             connected_count, _multiplex_skipped_platforms
         )

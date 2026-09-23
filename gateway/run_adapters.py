@@ -958,16 +958,31 @@ class GatewayAdapterLifecycleMixin:
         from hermes_cli.env_loader import hydrate_profile_secret_sources
         # Hydrate external secret sources off-loop ONCE: sync hydration would stall every heartbeat.
         await asyncio.to_thread(hydrate_profile_secret_sources, profile_home)
+
+        # Config + plugin discovery off-loop too: plugin import/register() runs under a per-plugin
+        # deadline that start()s and join()s a worker thread, and doing that on the loop for every
+        # secondary profile starved the liveness probe — measured 2026-09-23 (99 profiles), the
+        # shutdown watchdog killed the gateway mid-boot twice with the loop parked in
+        # plugins_loader.run_with_load_deadline. The scope is contextvars only (home override,
+        # secret scope, terminal scope) and asyncio.to_thread copies the context, so the worker
+        # sees exactly this profile's scope and the loop's own context is untouched.
+        def _load_off_loop():
+            with _profile_runtime_scope(profile_home, hydrate_secrets=False):
+                runtime_cfg = _load_gateway_config()
+                from hermes_cli.plugins import discover_plugins
+                discover_plugins()
+                cfg = load_gateway_config()
+                return runtime_cfg, cfg, _own_policy_open_startup_violation(cfg)
+
+        profile_runtime_cfg, profile_cfg, violation = await asyncio.to_thread(_load_off_loop)
+        # Hook registration writes the process-wide shell-hook/webhook registries the loop reads while
+        # serving: keep it on the loop, under the same scope. It reads only load_config(), so running
+        # it after load_gateway_config() instead of before changes nothing it depends on.
         with _profile_runtime_scope(profile_home, hydrate_secrets=False):
-            profile_runtime_cfg = _load_gateway_config()
-            from hermes_cli.plugins import discover_plugins
-            discover_plugins()
             # This profile's `hooks:` block: start() registered before any profile scope existed.
             self._register_config_hooks(
                 "shell-hook/webhook registration failed for profile '%s'", profile_name, level=logging.WARNING,
             )
-            profile_cfg = load_gateway_config()
-            violation = _own_policy_open_startup_violation(profile_cfg)
         self._snapshot_profile_busy_modes(profile_name, profile_runtime_cfg)
         if violation:
             raise MultiplexConfigError(
