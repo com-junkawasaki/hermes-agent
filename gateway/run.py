@@ -5686,7 +5686,11 @@ def _start_gateway_start_cron_and_housekeeping(runner):
     from cron.scheduler_provider import (
         InProcessCronScheduler, resolve_cron_scheduler, scheduler_for_profile_mode)
     from cron.scheduler import configure_global_parallel_limit
-    configure_global_parallel_limit((runner.config.get("cron") or {}).get("max_global_parallel_jobs"))
+    from hermes_cli.config import load_config_readonly
+    # GatewayConfig contains platform/runtime fields, not the raw cron section.
+    # Read the launch home's config before starting the shared ticker.
+    raw_config = load_config_readonly() or {}
+    configure_global_parallel_limit((raw_config.get("cron") or {}).get("max_global_parallel_jobs"))
     cron_stop = threading.Event()
     # ONE gateway process per host multiplexes every profile, so its cron ticker owns EVERY
     # profile's store — `gateway.multiplex_profiles` gates adapters, not cron. Gating the tick set
