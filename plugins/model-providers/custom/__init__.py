@@ -30,18 +30,41 @@ def _looks_like_ollama_endpoint(base_url: str | None) -> bool:
 class CustomProfile(ProviderProfile):
     """Custom/Ollama local provider — think=false and num_ctx support."""
 
-    def supported_reasoning_efforts(self, model: str | None) -> tuple[str, ...]:
-        """The OpenAI-compat wire set, mirroring this profile's own chat-completions clamp.
+    def _declared_efforts(self, ctx: dict) -> tuple[str, ...] | None:
+        """The reasoning ladder the target route declares on its own ``/v1/models``
+        (api.kotoba.cloud publishes ``reasoningEfforts`` and 400s levels outside it,
+        ADR 2609160940), or None when the route declares nothing / is unknown.
+        Cache-only: the picker's discovery fetch seeds the mirror, so this never
+        blocks the request path on HTTP."""
+        try:
+            from hermes_cli.models_reasoning_caps import custom_route_model_reasoning_capabilities
+            caps = custom_route_model_reasoning_capabilities(
+                ctx.get("base_url"), ctx.get("model"), allow_fetch=False)
+        except Exception:
+            return None
+        if caps and caps.get("authoritative"):
+            levels = tuple(str(e) for e in (caps.get("supported_efforts") or ()))
+            return levels or None
+        return None
 
-        Without this declaration the Responses transport clamps onto the OpenAI
-        per-model ladder (``codex_supported_efforts``), where ``max`` is gpt-5.6-only —
-        so a custom relay's model had a configured ``max`` silently demoted to
-        ``xhigh`` while the same provider over chat-completions forwarded ``max``
-        unchanged (#114249). A custom endpoint's vocabulary is undiscoverable, so
-        the widest OpenAI-compat set is the honest ceiling; ``ultra`` still clamps
-        to ``max`` via the shared ``clamp_effort`` policy.
+    def supported_reasoning_efforts(self, model: str | None) -> tuple[str, ...]:
+        """The ladder this profile's route declares, else the OpenAI-compat wire set.
+
+        A route that publishes ``reasoningEfforts`` on its own ``/v1/models``
+        (api.kotoba.cloud, ADR 2609160940) admits nothing outside it, so that
+        declaration wins; ``self.base_url``/``model`` identify the route for a custom
+        endpoint and the request path gets the per-call view via :meth:`_declared_efforts`.
+
+        Undeclared: without a profile declaration the Responses transport clamps onto the
+        OpenAI per-model ladder (``codex_supported_efforts``), where ``max`` is gpt-5.6-only —
+        so a custom relay's model had a configured ``max`` silently demoted to ``xhigh``
+        while the same provider over chat-completions forwarded ``max`` unchanged
+        (#114249). A custom endpoint's vocabulary is otherwise undiscoverable, so the
+        widest OpenAI-compat set is the honest ceiling; ``ultra`` still clamps to ``max``
+        via the shared ``clamp_effort`` policy.
         """
-        return OPENAI_COMPAT_WIRE_EFFORTS
+        declared = self._declared_efforts({"base_url": self.base_url, "model": model})
+        return declared if declared else OPENAI_COMPAT_WIRE_EFFORTS
 
     def default_reasoning_config(self, model: str | None = None) -> dict | None:
         """Unset ``agent.reasoning_effort`` → ``medium``, as on the Nous / OpenRouter profiles.
@@ -68,11 +91,19 @@ class CustomProfile(ProviderProfile):
         # the main loop after the route rejected the reasoning field — an unset main
         # effort arrives here already filled by default_reasoning_config). Never emit
         # think=True (Ollama-only flag).
+        # A route that publishes its own ladder (reasoningEfforts on /v1/models)
+        # REJECTS levels outside it — clamp against the declaration, nearest
+        # weaker, so a stale configured xhigh degrades honestly instead of
+        # breaking the session on a 400.
+        declared = self._declared_efforts(ctx)
         if reasoning_config and isinstance(reasoning_config, dict):
             effort = (reasoning_config.get("effort") or "").strip().lower()
             if effort == "none" or reasoning_config.get("enabled", True) is False:
                 # See #14820.
-                top_level["reasoning_effort"] = "none"
+                if declared is not None and "none" not in declared:
+                    pass  # thinking-off on an OFFLESS ladder: the route rejects none — omit so its floor applies
+                else:
+                    top_level["reasoning_effort"] = "none"
                 if _looks_like_ollama_endpoint(ctx.get("base_url")):
                     extra_body["think"] = False
             elif effort and base_url_host_matches(str(ctx.get("base_url") or ""), "api.groq.com"):
@@ -80,7 +111,7 @@ class CustomProfile(ProviderProfile):
                 # "none" / "default"; any graded level ("medium", "high") 400s (#75089).
                 top_level["reasoning_effort"] = "default"
             elif effort:
-                top_level["reasoning_effort"] = clamp_effort(effort, OPENAI_COMPAT_WIRE_EFFORTS)
+                top_level["reasoning_effort"] = clamp_effort(effort, declared or OPENAI_COMPAT_WIRE_EFFORTS)
         return extra_body, top_level
 
     def fetch_models(

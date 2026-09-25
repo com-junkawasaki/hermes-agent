@@ -50,6 +50,21 @@ from agent.turn_failure_copy import is_max_iteration_handoff
 
 logger = logging.getLogger(__name__)
 
+# The per-profile executors protect individual homes, but a multiplexed gateway
+# can otherwise dispatch one worker from every home at once.  Admission is
+# process-wide and happens before an execution receipt is created, so a job
+# deferred for host capacity stays due for the next tick.
+_global_dispatch_semaphore: Optional[threading.BoundedSemaphore] = None
+
+
+def configure_global_parallel_limit(limit: Optional[int]) -> None:
+    """Set the gateway process's total cron dispatch budget before its ticker starts."""
+    global _global_dispatch_semaphore
+    value = int(limit or 0)
+    if value < 0:
+        raise ValueError("cron.max_global_parallel_jobs must be nonnegative")
+    _global_dispatch_semaphore = threading.BoundedSemaphore(value) if value else None
+
 
 def _close_late_session_db_result(future: "concurrent.futures.Future") -> None:
     """Done-callback: close a SessionDB whose constructor finished after run_job's init timeout
@@ -4080,6 +4095,12 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
     if not try_register_running_job(job_id):
         logger.info("Job '%s' already running — skipping", job_label)
         return None
+    _capacity = _global_dispatch_semaphore
+    if _capacity is not None and not _capacity.acquire(blocking=False):
+        release_running_job(job_id)
+        _clear_run_claim_best_effort()
+        logger.info("Job '%s' deferred — global cron capacity is full", job_label)
+        return None
     # The home the claim was registered under. The pool worker's ``finally`` runs OUTSIDE
     # ``ctx.run``, where the per-profile cron scope is not bound, so releasing without it would
     # discard the LAUNCH home's key and leak every secondary profile's claim.
@@ -4093,6 +4114,8 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
     except Exception as execution_err:
         # Release the claim so the next tick retries instead of wedging "already running".
         release_running_job(job_id, home=_claim_home)
+        if _capacity is not None:
+            _capacity.release()
         _clear_run_claim_best_effort()
         logger.exception(
             "Job '%s' not dispatched: execution creation failed: %s", job_label, execution_err)
@@ -4103,11 +4126,15 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
             return ctx.run(process_job, j)
         finally:
             release_running_job(j["id"], home=home)
+            if _capacity is not None:
+                _capacity.release()
 
     try:
         fut = pool.submit(_run_and_release)
     except Exception as submit_err:
         release_running_job(job_id, home=_claim_home)
+        if _capacity is not None:
+            _capacity.release()
         _clear_run_claim_best_effort()
         finish_execution(
             execution["id"], success=False, error=f"Executor dispatch failed: {submit_err}")

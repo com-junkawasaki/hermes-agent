@@ -1849,17 +1849,32 @@ async def _discover_gateway_mcp_tools(config: object) -> None:
     same gate the CLI's background discovery uses. An expired token then parks the server with an
     actionable ``hermes mcp login`` warning instead of opening an authorize tab.
     """
+    from hermes_cli.config import load_config_readonly
+    from hermes_cli.plugins import has_enabled_agent_plugin_mcp
     from tools.mcp_oauth import suppress_interactive_oauth
     from tools.mcp_tool_discovery import discover_mcp_tools
+
+    def _needed() -> bool:
+        # Discovery also loads every enabled plugin. On a host with no MCP surface,
+        # that work can keep the gateway in startup long after cron should be live.
+        # The manifest probe preserves portable MCP packages without importing them.
+        try:
+            raw = load_config_readonly() or {}
+            return bool(raw.get("mcp_servers")) or has_enabled_agent_plugin_mcp(raw)
+        except Exception:
+            return True  # an unreadable config is not evidence that MCP is absent
+
     loop = asyncio.get_running_loop()
     with suppress_interactive_oauth():
         if not getattr(config, "multiplex_profiles", False):
-            await loop.run_in_executor(None, copy_context().run, discover_mcp_tools)
+            if _needed():
+                await loop.run_in_executor(None, copy_context().run, discover_mcp_tools)
             return
         for profile_name, profile_home in _multiplex_profile_homes(config):
             try:
                 with _profile_runtime_scope(Path(profile_home)):
-                    await loop.run_in_executor(None, copy_context().run, discover_mcp_tools)
+                    if _needed():
+                        await loop.run_in_executor(None, copy_context().run, discover_mcp_tools)
             except Exception:
                 logger.warning("MCP tool discovery failed for profile '%s'", profile_name, exc_info=True)
 
@@ -3658,7 +3673,7 @@ class GatewayRunner(
             logger.debug("approvals.mode startup check skipped", exc_info=True)
 
     def _init_session_db(self) -> None:
-        """Open the session DB for the active scope and run opportunistic state.db / checkpoint maintenance."""
+        """Open the launch scope's session DB; defer fleet maintenance to housekeeping."""
         # Session DB is a property caching one AsyncSessionDB per path (a handle bound here would pin the
         # root home under multiplex); priming here keeps startup diagnostics at init.
         # Initialize session database for session_search tool support. Same frozen-handle class of bug as
@@ -3678,27 +3693,10 @@ class GatewayRunner(
             logger.warning("SQLite session store not available: %s", e)
             self._session_db_init_error = str(e)  # surfaced on the home channel(s) once connected
 
-        # Opportunistic state.db maintenance (prune + optional VACUUM), at most once per min_interval_hours.
-        # A few blocking seconds per day is fine for a long-lived gateway; failures log, never raise.
-        # Surface the failure to the user via their home channel(s) once the gateway connects. Without this,
-        # state.db corruption or NFS/SMB lock failures silently degrade the entire gateway — messages may
-        # flow but nothing is persisted, and the user has no indication until they try /resume and find
-        # nothing (#88235).
-        # Once per SERVED profile, each under its own scope: both the store and the ``sessions:``
-        # config that governs it must be the profile's own. Bound to ``self._session_db`` this ran
-        # against the construction-time launch home only, so a multiplexed secondary profile's
-        # state.db was never pruned or vacuumed by anybody, and the launch profile's
-        # retention_days/auto_prune decided whether it happened at all.
-        from gateway.run_profile_reconcile import _for_each_served_profile
-        _launch_sessions = _launch_sessions_dir(self.config)  # resolved OUTSIDE any profile scope
-        _housekeeping_chore(
-            "state.db startup maintenance",
-            lambda: _for_each_served_profile(
-                self, lambda _label: _housekeeping_state_db_maintenance(_launch_sessions)))
-        # Checkpoint store pruning is a housekeeping chore (``_housekeeping_checkpoint_prune``), not a
-        # constructor step: its ``git gc`` repacks the whole store (tens of seconds on a GB store) and
-        # here it ran before the control socket, adapters and the code_sha stamp — so the first
-        # restart of the day (the ``hermes update`` one) looked hung and failed fleet verification.
+        # Fleet-wide state.db maintenance is already the hourly profile-scoped housekeeping chore.
+        # Running it here opened every secondary store before adapters, control socket, and cron
+        # existed: large hosts could spend minutes in migrations (or exhaust file descriptors)
+        # while the scheduler reported no heartbeat. A profile's DB is still validated when opened.
 
     def _init_registries_and_clocks(self) -> None:
         """Pairing stores, hook registry, voice modes, background-task set, liveness and idle clocks."""
@@ -5640,6 +5638,12 @@ def _start_gateway_start_cron_and_housekeeping(runner):
     # The event loop is passed so cron delivery can use live adapters (E2EE support).
     from cron.scheduler_provider import (
         InProcessCronScheduler, resolve_cron_scheduler, scheduler_for_profile_mode)
+    from cron.scheduler import configure_global_parallel_limit
+    from hermes_cli.config import load_config_readonly
+    # GatewayConfig contains platform/runtime fields, not the raw cron section.
+    # Read the launch home's config before starting the shared ticker.
+    raw_config = load_config_readonly() or {}
+    configure_global_parallel_limit((raw_config.get("cron") or {}).get("max_global_parallel_jobs"))
     cron_stop = threading.Event()
     # ONE gateway process per host multiplexes every profile, so its cron ticker owns EVERY
     # profile's store — `gateway.multiplex_profiles` gates adapters, not cron. Gating the tick set

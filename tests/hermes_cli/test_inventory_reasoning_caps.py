@@ -156,3 +156,65 @@ def test_catalog_failure_never_breaks_the_picker(monkeypatch):
     caps = rows[0]["capabilities"]["deepseek/deepseek-v4-pro"]
     assert "supported_efforts" not in caps
     assert caps["reasoning"] is True
+
+
+def _patch_custom_route(monkeypatch, caps_by_model):
+    """Point the custom-route reader (cache-only path used by the picker) at a map."""
+    import hermes_cli.models_reasoning_caps as caps_mod
+
+    monkeypatch.setattr(caps_mod, "warm_custom_route_reasoning_caps_async", lambda base_url: None)
+
+    def _read(base_url, model_id, **kw):
+        assert kw.get("allow_fetch") is False, "the picker must never block on HTTP"
+        return caps_by_model.get(model_id)
+
+    monkeypatch.setattr(caps_mod, "custom_route_model_reasoning_capabilities", _read)
+
+
+def test_custom_route_declaration_reaches_the_picker(monkeypatch):
+    """api.kotoba.cloud's reasoningEfforts is the ladder IT admits (levels beyond
+    are a 400 at admission, ADR 2609160940) — unlike an aggregator's inferred
+    supported_efforts, the route's own declaration is forwarded and the picker
+    constrains itself to it."""
+    _patch_custom_route(monkeypatch, {
+        "qwen3.8-flash-next-whitehacker": {
+            "supports_reasoning": True,
+            "supported_efforts": ["none", "minimal", "low", "medium", "high"],
+            "mandatory": False,
+            "authoritative": True,
+        },
+    })
+    rows = [{"slug": "kotoba", "name": "kotoba", "is_user_defined": True,
+             "api_url": "https://api.kotoba.cloud/v1",
+             "models": ["qwen3.8-flash-next-whitehacker"]}]
+    inv._apply_capabilities(rows)
+
+    entry = rows[0]["capabilities"]["qwen3.8-flash-next-whitehacker"]
+    assert entry["reasoning"] is True
+    assert entry["can_disable_reasoning"] is True
+    assert entry["efforts"] == ["none", "minimal", "low", "medium", "high"]
+
+
+def test_custom_route_without_declaration_gains_no_efforts(monkeypatch):
+    """An undeclared route keeps the full-vocabulary picker (tri-state: None)."""
+    _patch_custom_route(monkeypatch, {})
+    rows = [{"slug": "local", "name": "local", "is_user_defined": True,
+             "api_url": "http://127.0.0.1:1234/v1", "models": ["some-vllm"]}]
+    inv._apply_capabilities(rows)
+
+    assert "efforts" not in rows[0]["capabilities"]["some-vllm"]
+
+
+def test_offless_declaration_disables_the_off_switch(monkeypatch):
+    """A route whose ladder has no ``none`` must not offer thinking-off."""
+    _patch_custom_route(monkeypatch, {
+        "locked": {"supports_reasoning": True, "supported_efforts": ["low", "high"],
+                   "mandatory": True, "authoritative": True},
+    })
+    rows = [{"slug": "lockedp", "name": "lockedp", "is_user_defined": True,
+             "api_url": "https://locked.example/v1", "models": ["locked"]}]
+    inv._apply_capabilities(rows)
+
+    entry = rows[0]["capabilities"]["locked"]
+    assert entry["can_disable_reasoning"] is False
+    assert entry["efforts"] == ["low", "high"]
