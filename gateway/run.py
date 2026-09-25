@@ -5920,12 +5920,35 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     except Exception as e:
         logger.debug("MCP tool discovery failed: %s", e)
 
+    # Cron must not wait for every secondary profile: start() brings those up one by one, and with
+    # 99 profiles that took ~28 min on 2026-09-23 — no job on ANY profile fired until it finished.
+    # start() calls this hook once the launch profile's adapters are connected; the ticker then runs
+    # while secondaries come up (a secondary's job that fires before its adapters exist falls back to
+    # the primary's routes or fails delivery closed — it still fires). None = start() never got there.
+    _early_cron: list = []
+
+    def _start_cron_on_primary_ready() -> None:
+        if not _early_cron:
+            _early_cron.append(_start_gateway_start_cron_and_housekeeping(runner))
+
+    runner._on_primary_adapters_ready = _start_cron_on_primary_ready
+
+    async def _stop_early_cron() -> None:
+        # Startup is not going to reach running mode: stop a ticker the hook already started.
+        if not _early_cron:
+            return
+        cron_stop, _provider, cron_thread, _housekeeping = _early_cron.pop()
+        cron_stop.set()
+        await _await_thread_exit(cron_thread, timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT)
+
     try:
         success = await runner.start()
     except BaseException:
+        await _stop_early_cron()
         _shutdown_gateway_health_export(runner)
         raise
     if not success:
+        await _stop_early_cron()
         _shutdown_gateway_health_export(runner)
         return False
 
@@ -5939,6 +5962,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     _best_effort(_recover_pending)
     if runner.should_exit_cleanly:
+        await _stop_early_cron()
         _shutdown_gateway_health_export(runner)
         if runner.exit_reason:
             logger.error("Gateway exiting cleanly: %s", runner.exit_reason)
@@ -5948,6 +5972,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         return True
     if not runner._running:
         # Startup aborted by restart/shutdown before running mode; preserve that path without starting cron.
+        await _stop_early_cron()
         try:
             await runner.wait_for_shutdown()
             try:
@@ -5959,7 +5984,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             _shutdown_gateway_health_export(runner)
 
     cron_stop, cron_provider, cron_thread, housekeeping_thread = (
-        _start_gateway_start_cron_and_housekeeping(runner))
+        _early_cron.pop() if _early_cron else _start_gateway_start_cron_and_housekeeping(runner))
 
     # READY only once adapters, cron and housekeeping run; missing systemd state just disables watchdog.
     runner._start_systemd_watchdog()
