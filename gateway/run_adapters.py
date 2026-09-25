@@ -34,6 +34,14 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+
+
+def _profile_declares_cron_only(home: Path) -> bool:
+    """Explicitly skip adapter/plugin boot for a profile whose only live surface is cron."""
+    from hermes_cli.config import read_user_config_raw
+    raw = read_user_config_raw(Path(home) / "config.yaml")
+    section = raw.get("gateway") if isinstance(raw, dict) else None
+    return isinstance(section, dict) and section.get("cron_only") is True
 _UNSET = object()  # "no per-profile human_delay snapshot": fall back to the primary's value
 
 
@@ -1063,6 +1071,10 @@ class GatewayAdapterLifecycleMixin:
         self, profile_name: str, profile_home: "Path", claimed: Dict[tuple, str]
     ) -> int:
         """Create+connect one profile's adapters under its runtime scope."""
+        if _profile_declares_cron_only(profile_home):
+            # It remains in the served set and the host cron ticker's profile list.
+            # A config edit changes profile_serve_signature and reconciles it normally.
+            return 0
         from gateway.run import _platform_has_bot_credential, _profile_runtime_scope
         profile_cfg = await self._load_secondary_profile_config(profile_name, profile_home)
         # Keep the served profile's config: host-wide passes (planned-restart notices) must reach
