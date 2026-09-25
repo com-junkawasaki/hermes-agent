@@ -161,3 +161,53 @@ def test_served_profile_process_checkpoint_is_recovered_at_startup(served, monke
     assert [w["session_id"] for w in registry.pending_watchers] == ["proc_alpha01"]
     # Idempotent across homes: the process-global registry already tracks it.
     assert runner._recover_secondary_process_checkpoints(registry) == 0
+
+
+def test_profiles_without_process_checkpoint_are_not_entered_at_startup(served, monkeypatch):
+    from gateway import run as gateway_run
+
+    assert not (served.alpha / "processes.json").exists()
+    entered = []
+    original_scope = gateway_run._profile_runtime_scope
+
+    def record_scope(home, *args, **kwargs):
+        entered.append(home)
+        return original_scope(home, *args, **kwargs)
+
+    monkeypatch.setattr(gateway_run, "_profile_runtime_scope", record_scope)
+    registry = SimpleNamespace(recover_from_checkpoint=lambda: 0)
+    assert served.runner._recover_secondary_process_checkpoints(registry) == 0
+    assert entered == []
+
+
+@pytest.mark.asyncio
+async def test_process_checkpoint_recovery_keeps_gateway_loop_responsive(tmp_path, monkeypatch):
+    from gateway import run as gateway_run
+    from tools.process_registry import process_registry
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_recovery():
+        started.set()
+        assert release.wait(5)
+        return 0
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._start_register_plugins_relay_hooks = lambda: None
+    runner._subscribe_plugin_rewire = lambda _manager: None
+    runner.hooks = SimpleNamespace(discover_and_load=lambda: None)
+    runner._recover_secondary_process_checkpoints = lambda _registry: 0
+    runner._recover_unclean_sessions = lambda: asyncio.sleep(0, result=(0, 0))
+    runner._suspend_stuck_loop_sessions = lambda: 0
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(process_registry, "recover_from_checkpoint", slow_recovery)
+    monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: object())
+    task = asyncio.create_task(runner._start_recover_previous_run())
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(started.wait, 2), 3)
+        await asyncio.wait_for(asyncio.sleep(0), 1)
+        assert not task.done()
+    finally:
+        release.set()
+    await asyncio.wait_for(task, 3)

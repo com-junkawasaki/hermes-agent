@@ -12,6 +12,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 from contextlib import suppress
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ logger = logging.getLogger(__name__)
 # a shorter ceiling here would let Python steal a lock Electron still considers live.
 # A full update (git pull + uv sync + desktop rebuild) is minutes.
 UPDATE_MARKER_MAX_AGE_SECONDS = 20 * 60
+_UPDATE_MARKER_REFRESH_SECONDS = 60
 
 MARKER_NAME = ".hermes-update-in-progress"
 
@@ -268,6 +270,28 @@ class UpdateLock:
         self.path = path or update_marker_path()
         self.acquired = False
         self.holder: UpdateHolder | None = None
+        self._refresh_stop = threading.Event()
+        self._refresh_thread: threading.Thread | None = None
+
+    def _refresh_marker(self) -> None:
+        """Renew our lease without truncating a marker another updater may read."""
+        fd = None
+        try:
+            fd = os.open(self.path, os.O_RDWR)
+            owner = int(os.read(fd, 32).splitlines()[0].strip())
+            if owner != os.getpid() or not self.acquired:
+                return
+            os.lseek(fd, len(f"{owner}\n"), os.SEEK_SET)
+            os.write(fd, f"{int(time.time())}\n".encode("ascii"))
+        except (OSError, IndexError, ValueError):
+            logger.debug("Could not renew update marker %s", self.path, exc_info=True)
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def _keep_marker_fresh(self) -> None:
+        while not self._refresh_stop.wait(_UPDATE_MARKER_REFRESH_SECONDS):
+            self._refresh_marker()
 
     def acquire(self) -> bool:
         """Claim the lock. Returns False (and sets ``holder``) if it's taken.
@@ -296,6 +320,10 @@ class UpdateLock:
             logger.debug("Could not write update marker %s: %s", self.path, exc)
             return True
         self.acquired = True
+        self._refresh_stop.clear()
+        self._refresh_thread = threading.Thread(
+            target=self._keep_marker_fresh, name="hermes-update-marker-refresh", daemon=True)
+        self._refresh_thread.start()
         return True
 
     def release(self) -> None:
@@ -303,6 +331,10 @@ class UpdateLock:
         if not self.acquired:
             return
         self.acquired = False
+        self._refresh_stop.set()
+        if self._refresh_thread is not None:
+            self._refresh_thread.join(timeout=1)
+            self._refresh_thread = None
         try:
             owner = int(self.path.read_text(encoding="utf-8-sig").splitlines()[0].strip())
         except (OSError, IndexError, ValueError):
