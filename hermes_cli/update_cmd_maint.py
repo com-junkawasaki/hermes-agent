@@ -6,6 +6,7 @@ test patches on ``update_cmd`` stay effective).
 """
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 import os
 import shutil
@@ -814,17 +815,26 @@ def _sync_profiles_after_update() -> None:
     """Best-effort per-profile syncs: bundled skills, ``.env`` backfill, Honcho profiles."""
     # All profiles incl. the active one: seed_profile_skills() subprocesses with an explicit
     # HERMES_HOME, so sync_skills()'s module-level HERMES_HOME cache can't skew it.
-    with suppress(Exception):
+    try:
         from hermes_cli.profiles import list_profiles, seed_profile_skills
         all_profiles = list_profiles()
         if all_profiles:
             print()
-            print("→ Syncing bundled skills to all profiles...")
-            for p in all_profiles:
+            print(f"→ Syncing bundled skills to {len(all_profiles)} profiles (up to 4 at once)...")
+
+            def _sync_one(p):
                 try:
-                    print(f"  {p.name}: {_profile_skill_sync_status(seed_profile_skills(p.path, quiet=True))}")
+                    return p.name, _profile_skill_sync_status(seed_profile_skills(p.path, quiet=True))
                 except Exception as pe:
-                    print(f"  {p.name}: error ({pe})")
+                    return p.name, f"error ({pe})"
+
+            # Each profile has its own HERMES_HOME and subprocess. A bounded pool keeps
+            # a large multiplexed host from waiting for every 60s timeout serially.
+            with ThreadPoolExecutor(max_workers=min(4, len(all_profiles))) as pool:
+                for name, status in pool.map(_sync_one, all_profiles):
+                    print(f"  {name}: {status}")
+    except Exception as exc:
+        print(f"  ⚠ Could not enumerate profiles for skill sync: {exc}")
 
     # Backfill .env for profiles created before .env seeding (copy the default's) so they
     # keep the credentials they were effectively using.
