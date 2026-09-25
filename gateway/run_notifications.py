@@ -12,6 +12,7 @@ import contextlib
 import dataclasses
 import json
 import logging
+import sqlite3
 import time
 from contextlib import suppress
 from datetime import datetime
@@ -107,6 +108,22 @@ def _raw_process_event_session_id(evt: dict) -> str:
     if not platform and any(evt.get(field) for field in ("chat_id", "chat_type", "thread_id")):
         return ""
     return str(evt.get("origin_session_id") or session_key or "").strip()
+
+
+def _profile_may_have_async_delegations(home: Path) -> bool:
+    """Cheap read-only probe; an unreadable ledger must still reach normal error handling."""
+    path = home / "state.db"
+    try:
+        if not path.is_file():
+            return False
+        with contextlib.closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0.2)) as db:
+            return db.execute("SELECT 1 FROM async_delegations LIMIT 1").fetchone() is not None
+    except sqlite3.OperationalError as exc:
+        if "no such table: async_delegations" in str(exc):
+            return False
+        return True
+    except (sqlite3.DatabaseError, OSError):
+        return True
 
 
 class GatewayNotificationsMixin:
@@ -1863,8 +1880,11 @@ class GatewayNotificationsMixin:
         for profile_name, profile_home in profile_homes:
             if profile_name == primary:
                 continue
+            profile_home = Path(profile_home)
+            if not _profile_may_have_async_delegations(profile_home):
+                continue
             try:
-                with _profile_runtime_scope(Path(profile_home), {}):
+                with _profile_runtime_scope(profile_home, {}):
                     count = fn()
             except Exception:
                 logger.warning("Could not replay async completions for profile %r", profile_name, exc_info=True)
