@@ -1081,10 +1081,16 @@ class GatewayStartupMixin:
         launch_home = get_hermes_home().resolve()
         recovered = 0
         for profile_name, profile_home in _multiplex_profile_homes(self.config):
-            if Path(profile_home).resolve() == launch_home:
+            profile_home = Path(profile_home)
+            if profile_home.resolve() == launch_home:
+                continue
+            # Most served profiles have never spawned a background process. Entering
+            # their complete runtime scope just to discover an absent checkpoint
+            # blocks the gateway loop once per profile on large hosts.
+            if not (profile_home / "processes.json").is_file():
                 continue
             try:
-                with _profile_runtime_scope(Path(profile_home), {}):
+                with _profile_runtime_scope(profile_home, {}):
                     recovered += process_registry.recover_from_checkpoint()
             except Exception:
                 logger.warning("Process checkpoint recovery for profile %r failed", profile_name, exc_info=True)
@@ -1104,8 +1110,10 @@ class GatewayStartupMixin:
         # served profile's file under its scope or those processes are never re-adopted.
         with _log_suppressed(logging.WARNING, "Process checkpoint recovery: %s"):
             from tools.process_registry import process_registry
-            recovered = process_registry.recover_from_checkpoint()
-            recovered += self._recover_secondary_process_checkpoints(process_registry)
+            # Profile recovery may scan hundreds of checkpoint stores. Keep the
+            # event loop responsive to its liveness probe while the scan runs.
+            recovered = await asyncio.to_thread(process_registry.recover_from_checkpoint)
+            recovered += await asyncio.to_thread(self._recover_secondary_process_checkpoints, process_registry)
             if recovered:
                 logger.info("Recovered %s background process(es) from previous run", recovered)
         # Recover the turns the last process left marked (in flight, or reply not yet ledgered).

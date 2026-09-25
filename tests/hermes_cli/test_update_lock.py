@@ -125,6 +125,28 @@ def test_marker_naming_our_own_pid_is_adopted(marker, monkeypatch):
     assert not marker.exists()
 
 
+def test_long_running_update_refreshes_its_marker(marker, monkeypatch):
+    lock = UpdateLock(path=marker)
+    assert lock.acquire()
+    real_time = time.time
+    monkeypatch.setattr(time, "time", lambda: real_time() + UPDATE_MARKER_MAX_AGE_SECONDS + 30)
+    lock._refresh_marker()
+    holder = read_live_update(path=marker)
+    assert holder is not None and holder.pid == os.getpid()
+    lock.release()
+
+
+def test_marker_refresh_does_not_retake_handoff_partner(marker, other_pid):
+    lock = UpdateLock(path=marker)
+    assert lock.acquire()
+    _claim(marker, other_pid)
+    before = marker.read_bytes()
+    lock._refresh_marker()
+    assert marker.read_bytes() == before
+    lock.release()
+    assert marker.read_bytes() == before
+
+
 def test_release_leaves_a_marker_a_handoff_partner_now_owns(marker):
     """The desktop writes the marker, then the Tauri updater takes ownership.
 
