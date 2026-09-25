@@ -13,14 +13,31 @@ from gateway.config import GatewayConfig
 @pytest.mark.asyncio
 async def test_gateway_startup_discovery_suppresses_interactive_oauth(monkeypatch):
     import gateway.run as gateway_run
+    from hermes_cli import config as _config
     from tools import mcp_tool_discovery as _mcp_discovery
     from tools.mcp_oauth import _is_interactive, force_interactive_oauth
 
     seen: list = []
+    monkeypatch.setattr(_config, "load_config_readonly", lambda: {"mcp_servers": {"test": {"command": "test"}}})
     monkeypatch.setattr(_mcp_discovery, "discover_mcp_tools", lambda: seen.append(_is_interactive()) or [])
     with force_interactive_oauth():  # even a "forced interactive" parent context is overridden
         await gateway_run._discover_gateway_mcp_tools(GatewayConfig(multiplex_profiles=False))
     assert seen == [False]
+
+
+@pytest.mark.asyncio
+async def test_gateway_skips_mcp_discovery_when_no_native_or_portable_servers(monkeypatch):
+    import gateway.run as gateway_run
+    from hermes_cli import config as _config
+    from hermes_cli import plugins as _plugins
+    from tools import mcp_tool_discovery as _mcp_discovery
+
+    seen = []
+    monkeypatch.setattr(_config, "load_config_readonly", lambda: {"plugins": {"enabled": ["ordinary"]}})
+    monkeypatch.setattr(_plugins, "has_enabled_agent_plugin_mcp", lambda _raw: False)
+    monkeypatch.setattr(_mcp_discovery, "discover_mcp_tools", lambda: seen.append("called"))
+    await gateway_run._discover_gateway_mcp_tools(GatewayConfig(multiplex_profiles=False))
+    assert seen == []
 
 
 def test_mcp_config_reconciler_reconciles_every_tick_after_baseline(monkeypatch, tmp_path: Path):

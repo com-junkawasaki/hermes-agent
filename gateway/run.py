@@ -1893,17 +1893,32 @@ async def _discover_gateway_mcp_tools(config: object) -> None:
     same gate the CLI's background discovery uses. An expired token then parks the server with an
     actionable ``hermes mcp login`` warning instead of opening an authorize tab.
     """
+    from hermes_cli.config import load_config_readonly
+    from hermes_cli.plugins import has_enabled_agent_plugin_mcp
     from tools.mcp_oauth import suppress_interactive_oauth
     from tools.mcp_tool_discovery import discover_mcp_tools
+
+    def _needed() -> bool:
+        # Discovery also loads every enabled plugin. On a host with no MCP surface,
+        # that work can keep the gateway in startup long after cron should be live.
+        # The manifest probe preserves portable MCP packages without importing them.
+        try:
+            raw = load_config_readonly() or {}
+            return bool(raw.get("mcp_servers")) or has_enabled_agent_plugin_mcp(raw)
+        except Exception:
+            return True  # an unreadable config is not evidence that MCP is absent
+
     loop = asyncio.get_running_loop()
     with suppress_interactive_oauth():
         if not getattr(config, "multiplex_profiles", False):
-            await loop.run_in_executor(None, copy_context().run, discover_mcp_tools)
+            if _needed():
+                await loop.run_in_executor(None, copy_context().run, discover_mcp_tools)
             return
         for profile_name, profile_home in _multiplex_profile_homes(config):
             try:
                 with _profile_runtime_scope(Path(profile_home)):
-                    await loop.run_in_executor(None, copy_context().run, discover_mcp_tools)
+                    if _needed():
+                        await loop.run_in_executor(None, copy_context().run, discover_mcp_tools)
             except Exception:
                 logger.warning("MCP tool discovery failed for profile '%s'", profile_name, exc_info=True)
 
