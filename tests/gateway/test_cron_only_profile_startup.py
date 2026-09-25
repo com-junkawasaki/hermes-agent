@@ -88,3 +88,31 @@ async def test_many_cron_only_profiles_yield_to_gateway_liveness(tmp_path: Path,
     assert not task.done(), "startup never yielded to the gateway loop"
     assert await asyncio.wait_for(task, 1) == 0
     assert len(runner._served_profile_signatures) == 64
+
+
+@pytest.mark.asyncio
+async def test_shutdown_stops_secondary_profile_startup_scan(tmp_path: Path, monkeypatch):
+    import gateway.run as gateway_run
+    from gateway.run_adapters import GatewayAdapterLifecycleMixin
+
+    homes = [("default", tmp_path / "default"), ("first", tmp_path / "first"),
+             ("second", tmp_path / "second")]
+    runner = GatewayAdapterLifecycleMixin()
+    runner.config = object()
+    runner._shutdown_event = asyncio.Event()
+    monkeypatch.setattr(runner, "_multiplex_on", lambda: True)
+    monkeypatch.setattr(runner, "_primary_resource_claims", lambda _active: {})
+    monkeypatch.setattr(gateway_run, "_multiplex_profile_homes", lambda _config: homes)
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "default")
+    monkeypatch.setattr("hermes_cli.profiles.profiles_to_serve", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr("gateway.run_profile_reconcile.profile_serve_signature", lambda _home: ())
+    seen = []
+
+    async def boot(name, *_args):
+        seen.append(name)
+        runner._shutdown_event.set()
+        return 0
+
+    monkeypatch.setattr(runner, "_start_one_profile_adapters", boot)
+    assert await runner._start_secondary_profile_adapters() == 0
+    assert seen == ["first"]
