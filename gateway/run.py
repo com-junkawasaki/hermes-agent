@@ -5670,6 +5670,8 @@ def _start_gateway_start_cron_and_housekeeping(runner):
     # The event loop is passed so cron delivery can use live adapters (E2EE support).
     from cron.scheduler_provider import (
         InProcessCronScheduler, resolve_cron_scheduler, scheduler_for_profile_mode)
+    from cron.scheduler import configure_global_parallel_limit
+    configure_global_parallel_limit((runner.config.get("cron") or {}).get("max_global_parallel_jobs"))
     cron_stop = threading.Event()
     # ONE gateway process per host multiplexes every profile, so its cron ticker owns EVERY
     # profile's store — `gateway.multiplex_profiles` gates adapters, not cron. Gating the tick set
