@@ -33,6 +33,9 @@ class _ReadOnlyIdleProbe:
     def has_pending_handoffs(self) -> bool:
         return bool(self._read("SELECT 1 FROM sessions WHERE handoff_state = 'pending' LIMIT 1"))
 
+    def has_running_handoffs(self) -> bool:
+        return bool(self._read("SELECT 1 FROM sessions WHERE handoff_state = 'running' LIMIT 1"))
+
 
 def _profile_session_db_probe(profile_home: Path) -> Optional[Any]:
     """A short-lived read-only view; absent DB means no persisted work."""
@@ -52,6 +55,9 @@ class _EmptyIdleProbe:
         return []
 
     def has_pending_handoffs(self) -> bool:
+        return False
+
+    def has_running_handoffs(self) -> bool:
         return False
 
 
@@ -80,6 +86,11 @@ def profile_has_active_loop(profile_home: Path) -> bool:
 
 def profile_has_pending_handoff(profile_home: Path) -> bool:
     return _gate(profile_home, lambda db: db.has_pending_handoffs())
+
+
+def profile_has_running_handoff(profile_home: Path) -> bool:
+    """Only a stranded running handoff needs startup reclaim in this profile."""
+    return _gate(profile_home, lambda db: db.has_running_handoffs())
 
 
 async def off_loop_gate(runner: object, probe: Callable[[], bool]) -> bool:

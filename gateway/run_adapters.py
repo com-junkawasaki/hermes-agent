@@ -482,7 +482,8 @@ class GatewayAdapterLifecycleMixin:
         → running), re-bind the home channel to the CLI session_id, dispatch a synthetic event, mark
         ``completed``/``failed``."""
         from gateway.run import _async_profile_runtime_scope, _handoff_watch_scopes, _reclaim_stale
-        from gateway.run_idle_gates import off_loop_gate, profile_has_pending_handoff
+        from gateway.run_idle_gates import (
+            off_loop_gate, profile_has_pending_handoff, profile_has_running_handoff)
         await asyncio.sleep(5)  # let platforms connect before dispatching through them
         # Does _process_handoff accept the profile argument? Test stand-ins bind a one-arg callable.
         try:
@@ -544,6 +545,9 @@ class GatewayAdapterLifecycleMixin:
 
         for _pname, _phome in _handoff_watch_scopes(self):
             with _log_suppressed(logging.DEBUG, "Stale-handoff reclaim failed", exc_info=True):
+                if _phome is not None and not await off_loop_gate(
+                        self, lambda home=_phome: profile_has_running_handoff(home)):
+                    continue
                 async with _scope(_phome):
                     await _reclaim_stale(self)
         try:
