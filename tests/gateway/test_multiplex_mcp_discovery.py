@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +14,27 @@ from gateway.config import GatewayConfig, Platform
 from gateway.platforms.event import MessageEvent
 from gateway.session import SessionSource
 from hermes_constants import get_hermes_home, hermes_home_key
+
+
+@pytest.mark.asyncio
+async def test_gateway_mcp_discovery_does_not_hold_cron_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import gateway.run as gateway_run
+
+    release = asyncio.Event()
+    entered = asyncio.Event()
+
+    async def slow_discovery(_config: object) -> None:
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(gateway_run, "_discover_gateway_mcp_tools", slow_discovery)
+    task = gateway_run._start_gateway_mcp_discovery_background(object())
+    await asyncio.wait_for(entered.wait(), 1)
+    assert not task.done()
+    release.set()
+    await asyncio.wait_for(task, 1)
 
 
 @pytest.mark.asyncio

@@ -1879,6 +1879,22 @@ async def _discover_gateway_mcp_tools(config: object) -> None:
                 logger.warning("MCP tool discovery failed for profile '%s'", profile_name, exc_info=True)
 
 
+def _start_gateway_mcp_discovery_background(config: object) -> "asyncio.Task[None]":
+    """Keep slow profile MCP connections out of the cron and adapter startup path."""
+    task = asyncio.create_task(_discover_gateway_mcp_tools(config), name="gateway-mcp-discovery")
+
+    def _report_failure(done: "asyncio.Task[None]") -> None:
+        if done.cancelled():
+            return
+        try:
+            done.result()
+        except Exception:
+            logger.warning("Gateway MCP discovery failed", exc_info=True)
+
+    task.add_done_callback(_report_failure)
+    return task
+
+
 def _platform_has_bot_credential(platform: "Platform", platform_config: "PlatformConfig") -> bool:
     """Return True when a token-authenticated platform has a usable bot credential; platforms not using
     ``PlatformConfig.token`` (Signal session paths, port-binding HTTP adapters) always return True."""
@@ -5880,16 +5896,6 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     _best_effort(_start_keepalive, "Nous auth keepalive did not start: %s")
     _ensure_windows_gateway_venv_imports()
 
-    # discover_mcp_tools() blocks up to 120s; on the loop thread it would freeze platform heartbeats.
-    try:
-        # MCP tool discovery — run in an executor so the asyncio event loop stays responsive even when a
-        # configured MCP server is slow or unreachable.  discover_mcp_tools() uses a blocking 120s wait
-        # internally; calling it from the loop thread would freeze platform heartbeats (Discord shard,
-        # Telegram polling) until it returned. See #16856.
-        await _discover_gateway_mcp_tools(runner.config)
-    except Exception as e:
-        logger.debug("MCP tool discovery failed: %s", e)
-
     try:
         success = await runner.start()
     except BaseException:
@@ -5930,6 +5936,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     cron_stop, cron_provider, cron_thread, housekeeping_thread = (
         _start_gateway_start_cron_and_housekeeping(runner))
+    # A multiplexed host may serve many MCP profiles, each with a 120s connection
+    # timeout. Start discovery only after the cron ticker is live; the cron worker
+    # also discovers its own profile's MCP tools before constructing the agent.
+    _start_gateway_mcp_discovery_background(runner.config)
 
     # READY only once adapters, cron and housekeeping run; missing systemd state just disables watchdog.
     runner._start_systemd_watchdog()
