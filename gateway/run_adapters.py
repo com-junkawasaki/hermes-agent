@@ -897,6 +897,9 @@ class GatewayAdapterLifecycleMixin:
         self._served_profile_signatures = {}
         transient_failed = set()
         for index, (profile_name, profile_home) in enumerate(profile_homes):
+            shutdown_event = getattr(self, "_shutdown_event", None)
+            if shutdown_event is not None and shutdown_event.is_set():
+                return connected
             if profile_name == active:
                 continue  # handled by the primary startup loop
             # Preserve changes made while the initial connection is awaiting I/O.
