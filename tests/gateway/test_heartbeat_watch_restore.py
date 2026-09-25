@@ -183,11 +183,14 @@ async def test_restore_enters_each_profile_scope_once_per_scan(tmp_path, monkeyp
 
     home = tmp_path / '.hermes'
     named = home / 'profiles' / 'work'
+    idle = home / 'profiles' / 'idle'
     named.mkdir(parents=True)
+    idle.mkdir(parents=True)
     (named / 'config.yaml').write_text('{}')
+    (idle / 'config.yaml').write_text('{}')
     monkeypatch.setattr(Path, 'home', lambda: tmp_path)
     monkeypatch.setenv('HERMES_HOME', str(home))
-    dbs = {str(p): SessionDB(db_path=p / 'state.db') for p in (home, named)}
+    dbs = {str(p): SessionDB(db_path=p / 'state.db') for p in (home, named, idle)}
     monkeypatch.setattr(goals, '_DB_CACHE', dbs)
     config = GatewayConfig(multiplex_profiles=True)
     store = SessionStore(home / 'sessions', config)
@@ -200,6 +203,12 @@ async def test_restore_enters_each_profile_scope_once_per_scan(tmp_path, monkeyp
                 entry = store.get_or_create_session(source)
                 HeartbeatManager(entry.session_id).set('check', 60)
             expected[entry.session_key] = (entry.origin, entry.session_id)
+        # A routed session with no heartbeat must not open this profile's goals DB
+        # just because another profile has an active heartbeat.
+        with _profile_runtime_scope(idle):
+            store.get_or_create_session(SessionSource(
+                platform=Platform.TELEGRAM, chat_id='chat', thread_id='idle',
+                profile='idle', scope_id='workspace'))
         store.close_all_db_handles()
         runner = GatewayRunner.__new__(GatewayRunner)
         runner.config = config
