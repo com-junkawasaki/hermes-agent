@@ -38,14 +38,17 @@ def test_idle_gates_read_rows_and_close_every_connection(tmp_path, monkeypatch):
     assert not gates.profile_has_active_heartbeat(tmp_path)
     assert not gates.profile_has_active_loop(tmp_path)
     assert not gates.profile_has_pending_handoff(tmp_path)
+    assert not gates.profile_has_running_handoff(tmp_path)
     with real_connect(path) as db:
         db.execute("INSERT INTO state_meta VALUES (?, ?)", ("heartbeat:active", '{"status":"active"}'))
         db.execute("INSERT INTO state_meta VALUES (?, ?)", ("loop:active", '{"status":"active"}'))
         db.execute("INSERT INTO sessions VALUES ('pending')")
+        db.execute("INSERT INTO sessions VALUES ('running')")
     assert gates.profile_has_active_heartbeat(tmp_path)
     assert gates.profile_has_active_loop(tmp_path)
     assert gates.profile_has_pending_handoff(tmp_path)
-    assert len(opened) == 6 and all(db.closed for db in opened)
+    assert gates.profile_has_running_handoff(tmp_path)
+    assert len(opened) == 8 and all(db.closed for db in opened)
 
 
 def test_idle_gate_missing_db_is_empty_and_unreadable_db_fails_open(tmp_path):
