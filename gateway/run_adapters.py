@@ -896,7 +896,7 @@ class GatewayAdapterLifecycleMixin:
         profile_homes = _multiplex_profile_homes(self.config)
         self._served_profile_signatures = {}
         transient_failed = set()
-        for profile_name, profile_home in profile_homes:
+        for index, (profile_name, profile_home) in enumerate(profile_homes):
             if profile_name == active:
                 continue  # handled by the primary startup loop
             # Preserve changes made while the initial connection is awaiting I/O.
@@ -911,6 +911,10 @@ class GatewayAdapterLifecycleMixin:
                 transient_failed.add(profile_name)
             else:
                 self._served_profile_signatures[profile_name] = scan_signature
+            # A cron-only profile returns before its coroutine yields. On a large
+            # host, hundreds of those fast calls still starve loop liveness probes.
+            if (index + 1) % 16 == 0:
+                await asyncio.sleep(0)
         self._record_served_profiles(active, profile_homes)
         # ``_note_served_profiles`` fills a missing signature with the current one; that refill
         # would park a transiently-failed profile before the first watcher tick can retry it.

@@ -1,5 +1,6 @@
 """Cron-only profiles keep their schedules without booting unused adapters."""
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -56,3 +57,34 @@ def test_gateway_constructor_does_not_run_fleet_db_maintenance(monkeypatch):
     monkeypatch.setattr(gateway_run, "_housekeeping_chore", lambda *_args: (_ for _ in ()).throw(
         AssertionError("fleet DB maintenance ran before gateway startup")))
     runner._init_session_db()
+
+
+@pytest.mark.asyncio
+async def test_many_cron_only_profiles_yield_to_gateway_liveness(tmp_path: Path, monkeypatch):
+    import gateway.run as gateway_run
+    from gateway.run_adapters import GatewayAdapterLifecycleMixin
+
+    homes = [("default", tmp_path / "default")]
+    homes += [(f"p{i}", tmp_path / f"p{i}") for i in range(64)]
+    runner = GatewayAdapterLifecycleMixin()
+    runner.config = object()
+    monkeypatch.setattr(runner, "_multiplex_on", lambda: True)
+    monkeypatch.setattr(runner, "_primary_resource_claims", lambda _active: {})
+    monkeypatch.setattr(runner, "_record_served_profiles", lambda *_args: None)
+    monkeypatch.setattr(runner, "_restore_secondary_completion_ledgers", lambda *_args: None, raising=False)
+    monkeypatch.setattr(gateway_run, "_multiplex_profile_homes", lambda _config: homes)
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "default")
+    monkeypatch.setattr("hermes_cli.profiles.profiles_to_serve", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr("gateway.run_profile_reconcile.profile_serve_signature", lambda _home: ())
+
+    async def empty_adapter_boot(*_args):
+        return 0
+
+    monkeypatch.setattr(runner, "_start_one_profile_adapters", empty_adapter_boot)
+    task = asyncio.create_task(runner._start_secondary_profile_adapters())
+    pulse = asyncio.Event()
+    asyncio.get_running_loop().call_soon(pulse.set)
+    await asyncio.wait_for(pulse.wait(), 1)
+    assert not task.done(), "startup never yielded to the gateway loop"
+    assert await asyncio.wait_for(task, 1) == 0
+    assert len(runner._served_profile_signatures) == 64
