@@ -912,14 +912,20 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
     if home.parent.name != "profiles":
         argv += ["-p", "default"]
     if job.get("no_agent"):
-        # A no-agent cron job has no model of its own. Its Bot Chat delivery is
-        # a fresh reporting turn; an old Bot Chat session may carry a model
-        # whose context is now below Hermes' minimum. Use the target profile's
-        # current default instead of restoring that stale session model.
+        # Its Bot Chat delivery is a fresh reporting turn; an old Bot Chat
+        # session may carry a model below Hermes' minimum context. A job may
+        # pin a reporting model even though its script itself uses no agent.
+        # Otherwise follow the target profile's current default.
         model_config = target_config.get("model") if isinstance(target_config, dict) else None
-        current_model = model_config.get("default") if isinstance(model_config, dict) else None
+        model_config = model_config if isinstance(model_config, dict) else {}
+        pinned_model = job.get("model")
+        current_model = pinned_model or model_config.get("default")
+        current_provider = ((job.get("provider") if pinned_model else model_config.get("provider"))
+                            or None)
         if isinstance(current_model, str) and current_model.strip():
             argv += ["--model", current_model.strip()]
+            if isinstance(current_provider, str) and current_provider.strip():
+                argv += ["--provider", current_provider.strip()]
 
     query_file = None
     try:
