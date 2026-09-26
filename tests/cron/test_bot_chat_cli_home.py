@@ -77,3 +77,32 @@ def test_missing_destination_never_launches_or_recreates(tmp_path, monkeypatch, 
         assert not home.exists()
     finally:
         reset_hermes_home_override(token)
+
+
+@pytest.mark.parametrize("no_agent,expected_model", [(True, "murakumo/free"), (False, None)])
+def test_no_agent_bot_chat_uses_target_current_model(tmp_path, monkeypatch, no_agent, expected_model):
+    root = tmp_path / "custom"
+    home = root / "profiles" / "beta"
+    home.mkdir(parents=True)
+    (home / "config.yaml").write_text("model:\n  default: murakumo/free\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    token = set_hermes_home_override(str(root))
+    seen = []
+
+    def run(argv, env, report_path, timeout):
+        seen.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr("tools.bot_live_delivery.find_canonical_live_owner", lambda _home: None)
+    monkeypatch.setattr(delivery, "_run_bot_chat_turn", run)
+    try:
+        assert delivery._deliver_to_bot_chat(
+            {"id": "job", "no_agent": no_agent}, "output", "beta") is None
+        assert len(seen) == 1
+        if expected_model:
+            assert seen[0][seen[0].index("--model") + 1] == expected_model
+        else:
+            assert "--model" not in seen[0]
+    finally:
+        reset_hermes_home_override(token)

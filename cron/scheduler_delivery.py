@@ -810,8 +810,9 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
         for_failure = for_failure or bool((deferred or {}).get("for_failure"))
         from gateway.warning_notifications import warning_notifications_enabled
         from hermes_cli.config_effective import load_user_config_effective
+        target_config = load_user_config_effective(home / "config.yaml")
         suppress_notification = for_failure and not warning_notifications_enabled(
-            BOT_CHAT_POLICY_PLATFORM, load_user_config_effective(home / "config.yaml"))
+            BOT_CHAT_POLICY_PLATFORM, target_config)
         if deferred is not None and not (home / "state.db").is_file():
             return f"bot-chat delivery target no longer exists: {home}; do not resend"
         # run_one_job/claim_fire attach the durable execution id before delivery. The
@@ -910,6 +911,15 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
                      f"profile's environment ({type(exc).__name__}: {exc}); do not resend")
     if home.parent.name != "profiles":
         argv += ["-p", "default"]
+    if job.get("no_agent"):
+        # A no-agent cron job has no model of its own. Its Bot Chat delivery is
+        # a fresh reporting turn; an old Bot Chat session may carry a model
+        # whose context is now below Hermes' minimum. Use the target profile's
+        # current default instead of restoring that stale session model.
+        model_config = target_config.get("model") if isinstance(target_config, dict) else None
+        current_model = model_config.get("default") if isinstance(model_config, dict) else None
+        if isinstance(current_model, str) and current_model.strip():
+            argv += ["--model", current_model.strip()]
 
     query_file = None
     try:
