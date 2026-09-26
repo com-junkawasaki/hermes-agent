@@ -79,12 +79,18 @@ def test_missing_destination_never_launches_or_recreates(tmp_path, monkeypatch, 
         reset_hermes_home_override(token)
 
 
-@pytest.mark.parametrize("no_agent,expected_model", [(True, "murakumo/free"), (False, None)])
-def test_no_agent_bot_chat_uses_target_current_model(tmp_path, monkeypatch, no_agent, expected_model):
+@pytest.mark.parametrize("job,expected_model,expected_provider", [
+    ({"no_agent": True}, "murakumo/free", "murakumo"),
+    ({"no_agent": True, "model": "qwen3.8-27b-whitehacker", "provider": "kotoba"},
+     "qwen3.8-27b-whitehacker", "kotoba"),
+    ({"no_agent": False}, None, None),
+])
+def test_no_agent_bot_chat_uses_reporting_route(tmp_path, monkeypatch, job, expected_model, expected_provider):
     root = tmp_path / "custom"
     home = root / "profiles" / "beta"
     home.mkdir(parents=True)
-    (home / "config.yaml").write_text("model:\n  default: murakumo/free\n", encoding="utf-8")
+    (home / "config.yaml").write_text(
+        "model:\n  default: murakumo/free\n  provider: murakumo\n", encoding="utf-8")
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_HOME", str(root))
     token = set_hermes_home_override(str(root))
@@ -98,11 +104,13 @@ def test_no_agent_bot_chat_uses_target_current_model(tmp_path, monkeypatch, no_a
     monkeypatch.setattr(delivery, "_run_bot_chat_turn", run)
     try:
         assert delivery._deliver_to_bot_chat(
-            {"id": "job", "no_agent": no_agent}, "output", "beta") is None
+            {"id": "job", **job}, "output", "beta") is None
         assert len(seen) == 1
         if expected_model:
             assert seen[0][seen[0].index("--model") + 1] == expected_model
+            assert seen[0][seen[0].index("--provider") + 1] == expected_provider
         else:
             assert "--model" not in seen[0]
+            assert "--provider" not in seen[0]
     finally:
         reset_hermes_home_override(token)
