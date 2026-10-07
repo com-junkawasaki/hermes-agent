@@ -810,8 +810,9 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
         for_failure = for_failure or bool((deferred or {}).get("for_failure"))
         from gateway.warning_notifications import warning_notifications_enabled
         from hermes_cli.config_effective import load_user_config_effective
+        target_config = load_user_config_effective(home / "config.yaml")
         suppress_notification = for_failure and not warning_notifications_enabled(
-            BOT_CHAT_POLICY_PLATFORM, load_user_config_effective(home / "config.yaml"))
+            BOT_CHAT_POLICY_PLATFORM, target_config)
         if deferred is not None and not (home / "state.db").is_file():
             return f"bot-chat delivery target no longer exists: {home}; do not resend"
         # run_one_job/claim_fire attach the durable execution id before delivery. The
@@ -910,6 +911,21 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
                      f"profile's environment ({type(exc).__name__}: {exc}); do not resend")
     if home.parent.name != "profiles":
         argv += ["-p", "default"]
+    if job.get("no_agent"):
+        # Its Bot Chat delivery is a fresh reporting turn; an old Bot Chat
+        # session may carry a model below Hermes' minimum context. A job may
+        # pin a reporting model even though its script itself uses no agent.
+        # Otherwise follow the target profile's current default.
+        model_config = target_config.get("model") if isinstance(target_config, dict) else None
+        model_config = model_config if isinstance(model_config, dict) else {}
+        pinned_model = job.get("model")
+        current_model = pinned_model or model_config.get("default")
+        current_provider = ((job.get("provider") if pinned_model else model_config.get("provider"))
+                            or None)
+        if isinstance(current_model, str) and current_model.strip():
+            argv += ["--model", current_model.strip()]
+            if isinstance(current_provider, str) and current_provider.strip():
+                argv += ["--provider", current_provider.strip()]
 
     query_file = None
     try:

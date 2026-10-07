@@ -38,9 +38,12 @@ async def restore_heartbeat_watches(runner) -> None:
         # The poller may have been spawned by a named profile's /heartbeat command.
         # Anchor even default origins to the gateway home, not inherited context.
         home = getattr(store, "_routing_home", None) or get_hermes_home()
-        # Cheap gate: with no heartbeat persisted in any served profile there is nothing to
-        # restore — skip the per-origin profile-scope re-parse over every routed session.
-        if not any(profile_has_active_heartbeat(h) for h in _watched_homes(runner, home)):
+        # Keep the per-home verdict. A single active heartbeat used to open the goals-cached
+        # SessionDB for EVERY routed session's profile below, pinning thousands of SQLite
+        # handles on a multiplex gateway even though those profiles had no heartbeat.
+        watched = _watched_homes(runner, home)
+        inactive = {h for h in watched if not profile_has_active_heartbeat(h)}
+        if len(inactive) == len(watched):
             return restored
         with _profile_runtime_scope(home):
             # Enter each profile's scope once per scan, not once per routed session: a scope entry
@@ -53,7 +56,12 @@ async def restore_heartbeat_watches(runner) -> None:
                     continue
                 try:
                     source = runner._restored_source(entry)
-                    by_scope.setdefault(runner._profile_scope_key_for_source(source), []).append((entry, source))
+                    scope = runner._profile_scope_key_for_source(source)
+                    # Unknown homes remain fail-open: the served set may have changed since
+                    # this scan began. Only a home we actually probed as idle is skipped.
+                    if (Path(scope) if scope is not None else Path(home)) in inactive:
+                        continue
+                    by_scope.setdefault(scope, []).append((entry, source))
                 except Exception:
                     logger.debug("heartbeat restore for %s failed", entry.session_key, exc_info=True)
             for group in by_scope.values():

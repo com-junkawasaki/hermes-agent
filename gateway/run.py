@@ -6,8 +6,9 @@ Run via ``python -m gateway.run`` or ``python cli.py --gateway``."""
 # hermes_bootstrap must be the very first import (UTF-8 stdio on Windows; no-op on POSIX).
 try:
     import hermes_bootstrap  # noqa: F401
-except ModuleNotFoundError:
-    pass  # a partial ``hermes update`` can leave the bootstrap unregistered; only Windows UTF-8 stdio suffers
+except ModuleNotFoundError as exc:  # a partial ``hermes update`` can leave the bootstrap unregistered
+    if exc.name != "hermes_bootstrap":
+        raise  # the bootstrap exists but cannot load: skipping it would skip PM activation
 
 import asyncio
 import concurrent.futures
@@ -1522,49 +1523,6 @@ def _collect_history_media_paths(agent_history: List[Dict[str, Any]]) -> set:
                         break
     return paths
 
-def _ensure_ssl_certs() -> None:
-    """Set SSL_CERT_FILE when the system hides CA certs from Python (NixOS etc.); must run BEFORE any
-    HTTP library is imported. A set-but-missing path breaks every later httpx client: treat as unset."""
-    configured_cert = os.environ.get("SSL_CERT_FILE")
-    if configured_cert:
-        if os.path.exists(configured_cert):
-            return  # user already configured it to a real file
-        logging.getLogger(__name__).warning(
-            "Ignoring stale SSL_CERT_FILE=%r because the path does not exist", configured_cert)
-        os.environ.pop("SSL_CERT_FILE", None)
-
-    import ssl
-
-    # 1. Python's compiled-in defaults
-    paths = ssl.get_default_verify_paths()
-    for candidate in (paths.cafile, paths.openssl_cafile):
-        if candidate and os.path.exists(candidate):
-            os.environ["SSL_CERT_FILE"] = candidate
-            return
-
-    # 2. certifi (ships its own Mozilla bundle)
-    try:
-        import certifi
-        os.environ["SSL_CERT_FILE"] = certifi.where()
-        return
-    except ImportError:
-        pass
-
-    # 3. Common distro / macOS locations
-    for candidate in (
-        "/etc/ssl/certs/ca-certificates.crt",               # Debian/Ubuntu/Gentoo
-        "/etc/pki/tls/certs/ca-bundle.crt",                 # RHEL/CentOS 7
-        "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", # RHEL/CentOS 8+
-        "/etc/ssl/ca-bundle.pem",                            # SUSE/OpenSUSE
-        "/etc/ssl/cert.pem",                                 # Alpine / macOS
-        "/etc/pki/tls/cert.pem",                             # Fedora
-        "/usr/local/etc/openssl@1.1/cert.pem",               # macOS Homebrew Intel
-        "/opt/homebrew/etc/openssl@1.1/cert.pem",            # macOS Homebrew ARM
-    ):
-        if os.path.exists(candidate):
-            os.environ["SSL_CERT_FILE"] = candidate
-            return
-
 def _home_target_env_var(platform_name: str) -> str:
     """Home-target env var: built-in ``_HOME_TARGET_ENV_VARS``, plugin registry, then
     ``<PLATFORM>_HOME_CHANNEL``."""
@@ -1594,12 +1552,14 @@ def _planned_restart_notification_pending() -> bool:
 # Gateway marker so a lazily imported cli.py load_cli_config() doesn't clobber TERMINAL_CWD.
 os.environ["_HERMES_GATEWAY"] = "1"
 
-_ensure_ssl_certs()
-
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from hermes_constants import get_hermes_home, get_hermes_home_override
-_hermes_home = get_hermes_home()
+from hermes_constants import get_hermes_home, get_hermes_home_override, get_process_hermes_home
+# The PROCESS's own home, never an import-time ContextVar: a multiplexed backend (``hermes serve``)
+# first imports this module lazily from a session's agent build, under that session's routed profile
+# override, and the import-time config bridge below would then latch the secondary's terminal.* and
+# settings into the launch process env for every later launch-profile turn.
+_hermes_home = get_process_hermes_home()
 
 # Load ~/.hermes/.env first: user-managed env files must override stale shell exports on restart.
 from hermes_cli.env_loader import load_hermes_dotenv
@@ -1813,25 +1773,28 @@ def _profile_runtime_scope(
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
     from agent.secret_scope import set_secret_scope, reset_secret_scope
 
-    home_token = set_hermes_home_override(str(profile_home))
-    if prepared_secret_scope is not None:
-        secrets = prepared_secret_scope
-    elif hydrate_secrets:
-        secrets = _load_profile_secret_scope(Path(profile_home))
-    else:
-        from agent.secret_scope import build_profile_secret_scope  # caller already hydrated off-loop
-        secrets = build_profile_secret_scope(Path(profile_home))
-    secret_token = set_secret_scope(secrets)
-    # Install the routed profile's COMPLETE terminal policy, never ambient TERMINAL_* a prior turn set.
-    # Without it terminal_tool reads the process-global TERMINAL_* vars a previous profile's turn may have
-    # pinned (first-writer-wins backend leak; #68559).
-    from tools.terminal_scope import install_and_reset_profile_terminal_scope
+    home_token = secret_token = None
+    try:
+        home_token = set_hermes_home_override(str(profile_home))
+        if prepared_secret_scope is not None:
+            secrets = prepared_secret_scope
+        elif hydrate_secrets:
+            secrets = _load_profile_secret_scope(Path(profile_home))
+        else:
+            from agent.secret_scope import build_profile_secret_scope  # caller already hydrated off-loop
+            secrets = build_profile_secret_scope(Path(profile_home))
+        secret_token = set_secret_scope(secrets, profile_home=str(profile_home))
+        # Install the routed profile's COMPLETE terminal policy, never ambient TERMINAL_* a prior turn set.
+        # Without it terminal_tool reads the process-global TERMINAL_* vars a previous profile's turn may have
+        # pinned (first-writer-wins backend leak; #68559).
+        from tools.terminal_scope import install_and_reset_profile_terminal_scope
 
-    with install_and_reset_profile_terminal_scope(Path(profile_home)):
-        try:
+        with install_and_reset_profile_terminal_scope(Path(profile_home)):
             yield
-        finally:
+    finally:
+        if secret_token is not None:
             reset_secret_scope(secret_token)
+        if home_token is not None:
             reset_hermes_home_override(home_token)
 
 
@@ -1886,19 +1849,50 @@ async def _discover_gateway_mcp_tools(config: object) -> None:
     same gate the CLI's background discovery uses. An expired token then parks the server with an
     actionable ``hermes mcp login`` warning instead of opening an authorize tab.
     """
+    from hermes_cli.config import load_config_readonly
+    from hermes_cli.plugins import has_enabled_agent_plugin_mcp
     from tools.mcp_oauth import suppress_interactive_oauth
     from tools.mcp_tool_discovery import discover_mcp_tools
+
+    def _needed() -> bool:
+        # Discovery also loads every enabled plugin. On a host with no MCP surface,
+        # that work can keep the gateway in startup long after cron should be live.
+        # The manifest probe preserves portable MCP packages without importing them.
+        try:
+            raw = load_config_readonly() or {}
+            return bool(raw.get("mcp_servers")) or has_enabled_agent_plugin_mcp(raw)
+        except Exception:
+            return True  # an unreadable config is not evidence that MCP is absent
+
     loop = asyncio.get_running_loop()
     with suppress_interactive_oauth():
         if not getattr(config, "multiplex_profiles", False):
-            await loop.run_in_executor(None, copy_context().run, discover_mcp_tools)
+            if _needed():
+                await loop.run_in_executor(None, copy_context().run, discover_mcp_tools)
             return
         for profile_name, profile_home in _multiplex_profile_homes(config):
             try:
                 with _profile_runtime_scope(Path(profile_home)):
-                    await loop.run_in_executor(None, copy_context().run, discover_mcp_tools)
+                    if _needed():
+                        await loop.run_in_executor(None, copy_context().run, discover_mcp_tools)
             except Exception:
                 logger.warning("MCP tool discovery failed for profile '%s'", profile_name, exc_info=True)
+
+
+def _start_gateway_mcp_discovery_background(config: object) -> "asyncio.Task[None]":
+    """Keep slow profile MCP connections out of the cron and adapter startup path."""
+    task = asyncio.create_task(_discover_gateway_mcp_tools(config), name="gateway-mcp-discovery")
+
+    def _report_failure(done: "asyncio.Task[None]") -> None:
+        if done.cancelled():
+            return
+        try:
+            done.result()
+        except Exception:
+            logger.warning("Gateway MCP discovery failed", exc_info=True)
+
+    task.add_done_callback(_report_failure)
+    return task
 
 
 def _platform_has_bot_credential(platform: "Platform", platform_config: "PlatformConfig") -> bool:
@@ -2788,7 +2782,7 @@ def _skill_slug_from_frontmatter(skill_md: Path) -> tuple[str | None, str | None
     """Derive ``(slug, declared_name)`` from a SKILL.md; ``(None, None)`` if unreadable or no ``name:``.
     Matches ``scan_skill_commands``: the slug comes from frontmatter ``name:``, NOT the directory."""
     try:
-        content = skill_md.read_text(encoding="utf-8", errors="replace")
+        content = skill_md.read_text(encoding="utf-8-sig", errors="replace")
     except Exception:
         return None, None
     content = content.lstrip("\ufeff")  # tolerate UTF-8 BOM (Windows editors)
@@ -3695,7 +3689,7 @@ class GatewayRunner(
             logger.debug("approvals.mode startup check skipped", exc_info=True)
 
     def _init_session_db(self) -> None:
-        """Open the session DB for the active scope and run opportunistic state.db / checkpoint maintenance."""
+        """Open the launch scope's session DB; defer fleet maintenance to housekeeping."""
         # Session DB is a property caching one AsyncSessionDB per path (a handle bound here would pin the
         # root home under multiplex); priming here keeps startup diagnostics at init.
         # Initialize session database for session_search tool support. Same frozen-handle class of bug as
@@ -3715,27 +3709,10 @@ class GatewayRunner(
             logger.warning("SQLite session store not available: %s", e)
             self._session_db_init_error = str(e)  # surfaced on the home channel(s) once connected
 
-        # Opportunistic state.db maintenance (prune + optional VACUUM), at most once per min_interval_hours.
-        # A few blocking seconds per day is fine for a long-lived gateway; failures log, never raise.
-        # Surface the failure to the user via their home channel(s) once the gateway connects. Without this,
-        # state.db corruption or NFS/SMB lock failures silently degrade the entire gateway — messages may
-        # flow but nothing is persisted, and the user has no indication until they try /resume and find
-        # nothing (#88235).
-        # Once per SERVED profile, each under its own scope: both the store and the ``sessions:``
-        # config that governs it must be the profile's own. Bound to ``self._session_db`` this ran
-        # against the construction-time launch home only, so a multiplexed secondary profile's
-        # state.db was never pruned or vacuumed by anybody, and the launch profile's
-        # retention_days/auto_prune decided whether it happened at all.
-        from gateway.run_profile_reconcile import _for_each_served_profile
-        _launch_sessions = _launch_sessions_dir(self.config)  # resolved OUTSIDE any profile scope
-        _housekeeping_chore(
-            "state.db startup maintenance",
-            lambda: _for_each_served_profile(
-                self, lambda _label: _housekeeping_state_db_maintenance(_launch_sessions)))
-        # Checkpoint store pruning is a housekeeping chore (``_housekeeping_checkpoint_prune``), not a
-        # constructor step: its ``git gc`` repacks the whole store (tens of seconds on a GB store) and
-        # here it ran before the control socket, adapters and the code_sha stamp — so the first
-        # restart of the day (the ``hermes update`` one) looked hung and failed fleet verification.
+        # Fleet-wide state.db maintenance is already the hourly profile-scoped housekeeping chore.
+        # Running it here opened every secondary store before adapters, control socket, and cron
+        # existed: large hosts could spend minutes in migrations (or exhaust file descriptors)
+        # while the scheduler reported no heartbeat. A profile's DB is still validated when opened.
 
     def _init_registries_and_clocks(self) -> None:
         """Pairing stores, hook registry, voice modes, background-task set, liveness and idle clocks."""
@@ -4044,8 +4021,9 @@ class GatewayRunner(
     _STUCK_LOOP_THRESHOLD = 3  # restarts while active before auto-suspend
     _STUCK_LOOP_FILE = ".restart_failure_counts"
 
-    # Reasons set by _stop_impl() on force-interrupt; "restart_interrupted" by suspend_recently_active()
-    # on crash recovery (no .clean_shutdown marker). All mean "killed mid-turn" -> startup auto-resume.
+    # Reasons set by _stop_impl() on force-interrupt; "restart_interrupted" by recover_interrupted_turns()
+    # for a crash-left turn marker (no .clean_shutdown marker). All mean "killed mid-turn" -> startup
+    # auto-resume.
     _AUTO_RESUME_REASONS = frozenset({"restart_timeout", "shutdown_timeout", "restart_interrupted"})
 
     _MAX_SUPERVISED_RESTARTS = 5
@@ -4673,6 +4651,16 @@ def _housekeeping_org_skill_sync() -> None:
     maybe_pull_org_skills()
 
 
+def _housekeeping_plugin_update_check() -> None:
+    """Plugin update-check cadence (plugins_cadence): due-gated by
+    plugins.auto_update_check_hours, read-only, receipt-surfaced; the
+    opt-in auto-apply rides the manual update pipeline. A network error
+    costs one warning and a stamped marker — never an apply."""
+    from hermes_cli.plugins_cadence import maybe_run_gateway_check
+
+    maybe_run_gateway_check(log=logger)
+
+
 def _launch_sessions_dir(config) -> Optional[Tuple[Path, Path]]:
     """``(launch home, its configured transcript dir)``, or ``None`` when the gateway carries none.
 
@@ -4758,7 +4746,7 @@ def _housekeeping_checkpoint_prune() -> None:
     """Checkpoint store retention + size cap on a live timer; ``auto_prune_from_config`` gates on
     ``checkpoints.auto_prune`` and the 24h ``.last_prune`` marker. Off the startup path because its
     ``git gc`` can block for tens of seconds on a large store."""
-    from tools.checkpoint_manager import auto_prune_from_config
+    from tools.checkpoint_maintenance import auto_prune_from_config
     auto_prune_from_config()
 
 
@@ -4827,6 +4815,10 @@ def _start_gateway_housekeeping(
             # Default-bound now, i.e. OUTSIDE any profile scope: this is the launch home's override.
             lambda _launch=_launch_sessions_dir(getattr(runner, "config", None)):
                 _housekeeping_state_db_maintenance(_launch))),
+        # Due-gated inside: the first tick after startup runs an overdue check, not tick 60.
+        # Per served profile: plugins dir, last-run marker and plugins.auto_apply are all the
+        # profile's own (get_hermes_home()/load_config_readonly() bind to the scope).
+        (1, "Plugin update check", profile_scoped_chore(runner, _housekeeping_plugin_update_check)),
         (1, "Deferred FTS retry tick", _housekeeping_deferred_fts_retry),
         (1, "gateway housekeeping memory trim", _housekeeping_memory_trim),
         (1, "MCP config reconcile", _mcp_config_reconciler(runner)),
@@ -5264,6 +5256,8 @@ def _start_gateway_make_restart_signal_handler(runner):
 
 def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdown: list):
     """Build the SIGINT/SIGTERM handler; ``_signal_initiated_shutdown[0]`` records an unplanned signal."""
+    planned_stop_seen = [False]
+
     def shutdown_signal_handler(received_signal=None):
         # Planned --replace takeover (sibling marked this PID): exit 0 so systemd won't revive us.
         def _takeover() -> bool:
@@ -5283,6 +5277,12 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
         planned_takeover = bool(_best_effort(_takeover, "Takeover marker check failed: %s"))
         planned_stop = received_signal == signal.SIGINT or (
             not planned_takeover and bool(_best_effort(_planned_stop, "Planned stop marker check failed: %s")))
+        # `hermes gateway stop` writes the marker, THEN signals: the planned-stop watcher can consume
+        # the marker in between, and the CLI's own SIGTERM must not then read as an external kill.
+        if planned_stop:
+            planned_stop_seen[0] = True
+        elif planned_stop_seen[0] and not planned_takeover:
+            planned_stop = True
         _shutdown_ctx = _best_effort(_snapshot, "snapshot_shutdown_context failed: %s")
         sig_name = _shutdown_ctx["signal"] if _shutdown_ctx else None
 
@@ -5466,19 +5466,23 @@ def _owner_is_standalone() -> bool:
 
 
 def _refuse_second_host_gateway(owner) -> None:
-    """Print the named refusal and exit 75 so a supervisor retries instead of parking the unit."""
+    """Print the named refusal and exit 75 so a supervisor retries instead of parking the unit.
+
+    Reached only after losing the host lock, so ``--replace`` is not offered: an owner that serves
+    this profile was already handled before the claim, and ``--replace`` does not skip the lock.
+    """
     from gateway import host_rendezvous as hr
     from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
-    from hermes_cli.gateway_migrate import MIGRATE_COMMAND
 
     who = hr.describe(owner) if owner else "owner unknown (its record is gone)"
     message = (
         f"❌ Another gateway already owns this host: {who}\n"
         f"   Exactly one gateway per host serves every profile, so this process will not start a\n"
         f"   second one (it would double-bind this profile's platforms).\n"
-        f"   Fold every profile onto the owner:  {MIGRATE_COMMAND}\n"
-        f"   Or take the host over:              hermes gateway run --replace\n"
-        f"   Or start one anyway:                hermes gateway run --force")
+        f"   Fold every profile onto the owner:  {_migrate_command()}\n"
+        f"   Or stop the other gateway first, then start this one.\n"
+        f"   Or start one anyway (skips the host-lock check):  hermes gateway run --force\n"
+        f"   (--replace does not skip this check; it only replaces an owner that serves this profile.)")
     logger.error("Refusing to start a second gateway on this host: %s", who)
     print(message)
     raise SystemExit(GATEWAY_SERVICE_RESTART_EXIT_CODE)
@@ -5496,7 +5500,7 @@ def _log_standalone_profiles_at_boot(runner) -> None:
         from hermes_cli.profiles import profiles_to_serve, profile_is_standalone
         from hermes_cli.gateway_multiplex_mode import STANDALONE_DEPRECATION_NOTICE
         served = set(runner.served_profile_names())
-        for name, home in profiles_to_serve(True, include_standalone=True):
+        for name, home in profiles_to_serve(True, include_standalone=True, include_parked=True):
             if name != "default" and name not in served and profile_is_standalone(home):
                 logger.warning("profile '%s' is standalone (gateway.standalone: true); not served by "
                                "this gateway. %s", name, STANDALONE_DEPRECATION_NOTICE)
@@ -5557,7 +5561,7 @@ async def _host_attach_or_none(replace: bool, force: bool = False) -> Optional[b
         print(decision.message)
         return False
     if decision.outcome == REPLACE_HOST and decision.owner is not None:
-        # --replace names the HOST process, whichever home launched it.
+        # decide() only targets an owner that serves this profile or has not published its served set.
         if not await _start_gateway_replace_existing_instance(decision.owner.pid, True):
             return False
     return None
@@ -5574,7 +5578,10 @@ async def _start_gateway_start_control_socket(runner):
         # failure only means consumers fall back to the process-scan/state-file layer, exactly as before
         # this feature. See #92091.
         from gateway.control_socket import GatewayControlServer
-        from gateway.run_profile_reconcile import migrate_profile_identity_verb, purge_profile_identity_verb
+        from gateway.run_profile_reconcile import (
+            migrate_profile_identity_verb, purge_profile_identity_verb,
+            unserve_profile_verb, serve_profile_verb,
+        )
         from gateway.run_plugin_rewire import reload_plugins_verb
         # pause-for-update: the updater asks us to drain + exit (freeing venv handles) vs. a tree-kill
         # (same path as SIGUSR1). Handler runs on the socket executor thread, so marshal onto the loop.
@@ -5624,6 +5631,8 @@ async def _start_gateway_start_control_socket(runner):
         _control_server = GatewayControlServer(
             verb_handlers={"pause-for-update": _pause_for_update_handler,
                            "rescan-profiles": _rescan_profiles_handler,
+                           "unserve-profile": unserve_profile_verb(runner),
+                           "serve-profile": serve_profile_verb(runner),
                            "migrate-profile-identity": migrate_profile_identity_verb(runner),
                            "purge-profile-identity": purge_profile_identity_verb(runner),
                            # A plugin installed/enabled by another process loads now and re-wires the
@@ -5645,6 +5654,12 @@ def _start_gateway_start_cron_and_housekeeping(runner):
     # The event loop is passed so cron delivery can use live adapters (E2EE support).
     from cron.scheduler_provider import (
         InProcessCronScheduler, resolve_cron_scheduler, scheduler_for_profile_mode)
+    from cron.scheduler import configure_global_parallel_limit
+    from hermes_cli.config import load_config_readonly
+    # GatewayConfig contains platform/runtime fields, not the raw cron section.
+    # Read the launch home's config before starting the shared ticker.
+    raw_config = load_config_readonly() or {}
+    configure_global_parallel_limit((raw_config.get("cron") or {}).get("max_global_parallel_jobs"))
     cron_stop = threading.Event()
     # ONE gateway process per host multiplexes every profile, so its cron ticker owns EVERY
     # profile's store — `gateway.multiplex_profiles` gates adapters, not cron. Gating the tick set
@@ -5853,7 +5868,12 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     _planned_stop_watcher_thread.start()
 
     # PID file BEFORE adapters: of two concurrent `run --replace`, only the O_EXCL winner opens sockets.
-    if not _start_gateway_claim_pid_file(force=force or replace):
+    # Only --force skips the host-lock refusal. Every generated unit carries --replace, so reading it as
+    # --force there disabled the one arbiter of the two-units-at-once race; a replace that took the
+    # owner over already freed the lock with that process. Consequence: a live holder this process
+    # cannot interrogate (its record never published, or it speaks another HOST_PROTOCOL_VERSION
+    # mid-upgrade) blocks every other unit with exit 75 until it exits; only --force gets past it.
+    if not _start_gateway_claim_pid_file(force=force):
         return False
 
     # Right after the PID claim (which makes us authoritative); non-fatal — consumers fall back to scan.
@@ -5875,16 +5895,6 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     _best_effort(_lifecycle_record_startup, "Lifecycle ledger startup record failed: %s")
     _best_effort(_start_keepalive, "Nous auth keepalive did not start: %s")
     _ensure_windows_gateway_venv_imports()
-
-    # discover_mcp_tools() blocks up to 120s; on the loop thread it would freeze platform heartbeats.
-    try:
-        # MCP tool discovery — run in an executor so the asyncio event loop stays responsive even when a
-        # configured MCP server is slow or unreachable.  discover_mcp_tools() uses a blocking 120s wait
-        # internally; calling it from the loop thread would freeze platform heartbeats (Discord shard,
-        # Telegram polling) until it returned. See #16856.
-        await _discover_gateway_mcp_tools(runner.config)
-    except Exception as e:
-        logger.debug("MCP tool discovery failed: %s", e)
 
     # Cron must not wait for every secondary profile: start() brings those up one by one, and with
     # 99 profiles that took ~28 min on 2026-09-23 — no job on ANY profile fired until it finished.
@@ -5951,6 +5961,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     cron_stop, cron_provider, cron_thread, housekeeping_thread = (
         _early_cron.pop() if _early_cron else _start_gateway_start_cron_and_housekeeping(runner))
+    # A multiplexed host may serve many MCP profiles, each with a 120s connection
+    # timeout. Start discovery only after the cron ticker is live; the cron worker
+    # also discovers its own profile's MCP tools before constructing the agent.
+    _start_gateway_mcp_discovery_background(runner.config)
 
     # READY only once adapters, cron and housekeeping run; missing systemd state just disables watchdog.
     runner._start_systemd_watchdog()
@@ -6005,6 +6019,27 @@ def main():
     for _step in (_register_identity, _arm_watchdog, _utf8_stdio):
         _best_effort(_step)
 
+    # pm startup contract (PATH provisioning for the store's tools), then
+    # the post-update bootstrap: the same one-pass record-gated maintenance
+    # registry the CLI dispatch path runs (hermes_cli/main.py) — this
+    # entrypoint bypasses that dispatch, so run it here too. Never raises.
+    try:
+        from hermes_cli.venv_sync import check_runtime
+        from pm.paths import install_root
+
+        problem = check_runtime(install_root())
+        if problem:
+            logger.warning(problem)
+    except Exception:
+        logger.debug("pm startup check failed", exc_info=True)
+    try:
+        from hermes_cli.boot_bootstrap import maybe_run_boot_bootstrap
+        from pm.paths import install_root
+
+        maybe_run_boot_bootstrap(install_root())
+    except Exception:
+        logger.debug("boot bootstrap failed", exc_info=True)
+
     import argparse
     parser = argparse.ArgumentParser(description="Hermes Gateway - Multi-platform messaging")
     parser.add_argument("--config", "-c", help="Path to gateway config file")
@@ -6013,8 +6048,8 @@ def main():
 
     config = None
     if args.config:
-        import yaml
-        with open(args.config, encoding="utf-8") as f:
+        import hermes_yaml as yaml
+        with open(args.config, encoding="utf-8-sig") as f:
             config = GatewayConfig.from_dict(yaml.safe_load(f) or {})
         # Same boot-time verdict the loaded config gets when the file leaves the flag unset.
         from hermes_cli.gateway_multiplex_mode import log_multiplex_decision, resolve_multiplex_mode

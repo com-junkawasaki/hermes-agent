@@ -102,8 +102,8 @@ async def test_watcher_gates_profile_scope_on_pending_handoffs(monkeypatch):
 
     The gate probes the profile's store off-loop; only a store WITH a pending handoff gets
     its scope entered by the tick. Both directions are the contract: no work → no scope
-    entry; work present → scope entered and the store polled. The startup reclaim is
-    exempt (once per boot, and it must also see 'running' leftovers)."""
+    entry; work present → scope entered and the store polled. Startup reclaim enters
+    only homes with a stranded running handoff."""
     scopes = [
         (None, None),
         ("bala", Path("/h/profiles/bala")),
@@ -111,7 +111,7 @@ async def test_watcher_gates_profile_scope_on_pending_handoffs(monkeypatch):
     ]
     monkeypatch.setattr(run, "_handoff_watch_scopes", lambda _r: scopes)
 
-    from hermes_cli import goals
+    from gateway import run_idle_gates
 
     entered = []
 
@@ -135,10 +135,12 @@ async def test_watcher_gates_profile_scope_on_pending_handoffs(monkeypatch):
 
     homes = [h for _n, h in scopes[1:]]
 
-    async def _run_once(pending_by_home):
-        monkeypatch.setattr(
-            goals, "_DB_CACHE",
-            {str(h): _ProbeDB(pending_by_home[h]) for h in homes})
+    async def _run_once(pending_by_home, running_by_home=None):
+        running_by_home = running_by_home or {}
+        monkeypatch.setattr(run_idle_gates, "profile_has_pending_handoff",
+                            lambda h: pending_by_home[h])
+        monkeypatch.setattr(run_idle_gates, "profile_has_running_handoff",
+                            lambda h: running_by_home.get(h, False))
         entered.clear()
         db = _RecordingDB()
         states = iter([True, False])
@@ -163,19 +165,22 @@ async def test_watcher_gates_profile_scope_on_pending_handoffs(monkeypatch):
         await asyncio.wait_for(coro, timeout=5)
         return db
 
-    # Idle: nothing pending anywhere → the tick skips both named scopes (only the
-    # startup reclaim enters them, once each); the unscoped root poll still runs.
+    # Idle: neither startup reclaim nor regular tick enters the named scopes.
     db = await _run_once({h: False for h in homes})
-    assert entered == homes, (
-        f"only the startup reclaim may enter idle profile scopes; got {entered}")
+    assert entered == []
     assert db.polls == 1, "only the root store is polled when no profile has work"
 
-    # Work in one profile → the tick enters THAT profile's scope (reclaim + tick),
-    # while the still-idle profile is entered only by the reclaim.
+    # Pending work enters that profile for the regular tick only.
     db = await _run_once({homes[0]: True, homes[1]: False})
-    assert entered == [homes[0], homes[1], homes[0]], (
+    assert entered == [homes[0]], (
         f"tick must enter exactly the profile with pending work; got {entered}")
     assert db.polls == 2, "root + the busy profile are polled"
+
+    # A stranded running handoff enters once for startup reclaim, even without
+    # a pending row for the regular tick.
+    db = await _run_once({h: False for h in homes}, {homes[1]: True})
+    assert entered == [homes[1]]
+    assert db.polls == 1
 
 
 @pytest.mark.asyncio
